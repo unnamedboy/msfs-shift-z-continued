@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<SimBase.Document Type="InGamePanels" version="1,0">
+  <Filename>ShiftZContinued.spb</Filename>
+  <InGamePanels.InGamePanelDefinition id="PANEL_SHIFT_Z_CONTINUED" Name="shift-z-continued" url="html_ui/InGamePanels/ShiftZContinued/index.html" resizeDirections="both" minWidth="20" minHeight="5" defaultWidth="180" defaultHeight="12" defaultTop="0" defaultRight="0" icon="ICON_SHIFT_Z_CONTINUED" buttonVisible="true" />
+</SimBase.Document>

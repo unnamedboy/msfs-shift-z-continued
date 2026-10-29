@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AssetPackage Name="shift-z-continued" Version="0.1.0">
+  <ItemSettings><ContentType>MISC</ContentType><Title>shift-z-continued</Title><Manufacturer>unnamedboy</Manufacturer><Creator>unnamedboy</Creator></ItemSettings>
+  <AssetGroups>
+    <AssetGroup Name="Panel"><Type>SPB</Type><Flags><FSXCompatibility>false</FSXCompatibility></Flags><AssetDir>PackageSources/InGamePanels</AssetDir><OutputDir>Build</OutputDir></AssetGroup>
+  </AssetGroups>
+</AssetPackage>

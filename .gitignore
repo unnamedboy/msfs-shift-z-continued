@@ -1,0 +1,22 @@
+# Original third-party reference materials
+/reference/
+
+# Generated SDK project and build output
+/PackageSources/
+/PackageDefinitions/
+/shift-z-build-*/
+/Packages/
+/PackagesMetadata/
+/_PackageInt/
+/dist/
+
+# Python and local tooling
+__pycache__/
+*.py[cod]
+.venv/
+*.log
+
+# Local configuration
+/.env
+/.env.*
+!/.env.example

@@ -1,0 +1,51 @@
+name: Build and package
+
+on:
+  push:
+    branches: [develop]
+  pull_request:
+    branches: [develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: cmd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --test tests/panel.test.js
+      - run: python -m unittest discover -s tests
+      - run: python tests/run_cpp_tests.py
+
+  package:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/develop'
+    needs: test
+    runs-on: [self-hosted, Windows, X64, msfs2024]
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: cmd
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Community package
+        run: python build.py
+      - name: Create installation ZIP
+        run: python package_release.py
+      - name: Upload installation ZIP
+        uses: actions/upload-artifact@v7
+        with:
+          path: dist/shift-z-continued.zip
+          archive: false
+          if-no-files-found: error

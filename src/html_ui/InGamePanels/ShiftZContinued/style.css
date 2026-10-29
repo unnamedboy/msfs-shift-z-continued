@@ -1,0 +1,5 @@
+ingame-ui#ShiftZContinued { background: transparent; border: 0; color: #ff5252; font: bold 16px sans-serif; pointer-events: none; width: 100% !important; height: 100% !important; min-width: 0 !important; min-height: 0 !important; }
+ingame-ui#ShiftZContinued #stats { padding: 0 0 0 40px; text-shadow: 1px 1px 2px black; white-space: pre-wrap; pointer-events: none; }
+ingame-ui#ShiftZContinued ingame-ui-header { display: none !important; }
+ingame-ui#ShiftZContinued .degree-mark { display: inline-block; width: .32em; height: .32em; box-sizing: border-box; border: .09em solid currentColor; border-radius: 50%; vertical-align: .5em; margin-left: .03em; }
+ingame-ui#ShiftZContinued .ingameUiWrapper, ingame-ui#ShiftZContinued .ingameUiContent { flex: 1 1 auto !important; width: 100% !important; height: 100% !important; min-width: 0 !important; min-height: 0 !important; }

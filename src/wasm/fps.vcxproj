@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations"><ProjectConfiguration Include="Release|MSFS"><Configuration>Release</Configuration><Platform>MSFS</Platform></ProjectConfiguration></ItemGroup>
+  <PropertyGroup Label="Globals"><VCProjectVersion>17.0</VCProjectVersion><ProjectGuid>{D8DE0B7C-0A30-4D77-B785-573EAB82C906}</ProjectGuid><RootNamespace>ShiftZContinuedFps</RootNamespace></PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration"><ConfigurationType>Application</ConfigurationType><PlatformToolset>MSFS2024</PlatformToolset><UseDebugLibraries>false</UseDebugLibraries></PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup><TargetName>shift-z-continued-fps</TargetName><TargetExt>.wasm</TargetExt><GenerateManifest>false</GenerateManifest></PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile><Optimization>MaxSpeed</Optimization><ExceptionHandling>false</ExceptionHandling><RuntimeTypeInfo>false</RuntimeTypeInfo><AdditionalIncludeDirectories>$(MSFS2024_SDK)\SimConnect SDK\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories></ClCompile>
+    <Link><NoEntryPoint>true</NoEntryPoint><GenerateDebugInformation>false</GenerateDebugInformation><OutputFile>$(OutDir)$(TargetName)$(TargetExt)</OutputFile></Link>
+  </ItemDefinitionGroup>
+  <ItemGroup><ClCompile Include="fps.cpp" /></ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>
