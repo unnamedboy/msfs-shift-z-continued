@@ -23,21 +23,25 @@ INSTALLATION
 2. Copy the entire "shift-z-continued" package folder into your MSFS 2024
    Community2024 folder. Keep the package's internal folder structure intact.
 3. Start or restart Microsoft Flight Simulator 2024.
-4. In a flight, open the in-game toolbar and look for the Shift Z Continued
-   panel icon. Open the panel from there.
+4. Enter a flight. This experiment attempts to load a blank overlay automatically;
+   press Shift+Z to show it. Automatic loading still requires simulator validation.
 
 USAGE
 -----
-With the panel open and receiving keyboard focus, press Shift+Z to cycle:
+EXPERIMENTAL WASM HOTKEY BUILD (experimental/wasm-hotkey)
+With the simulator focused, press left or right Shift+Z from the initial blank view:
 
   1. Flight data (position, altitude, heading, airspeed and wind)
   2. Performance data (FPS, G-force, fuel percentage and sim rate)
   3. Combined flight and performance data
   4. Blank view
 
-The shortcut currently works only when the panel receives keyboard input.
-Shift+Z is NOT yet a global shortcut, and it does not automatically open the
-panel. Use the simulator's in-game toolbar to open or close the panel.
+This build captures Shift+Z in WASM and forwards it to the panel over CommBus.
+It is intended to work without panel focus; in-simulator validation is pending.
+Panel registration attempts startup without a toolbar click, initially blank.
+If automatic loading fails, this no-toolbar experiment cannot display the overlay.
+There is no DOM keyboard fallback. If WASM hotkey registration fails, keyboard
+cycling is unavailable but FPS remains available. Pauses may delay cycle messages.
 
 NOTES / KNOWN LIMITATIONS
 -------------------------
@@ -45,7 +49,7 @@ NOTES / KNOWN LIMITATIONS
 - Panel positioning, mouse interaction and keyboard focus may require further
   adjustments.
 - FPS may display "N/A" if the accompanying WASM module is unavailable.
-- Automatic panel startup and a global Shift+Z hotkey are not yet implemented.
+- Automatic panel startup and the WASM hotkey are experimental and unverified in sim.
 - Persistent visibility and user-configurable data fields are not yet available.
 - VR and MSFS 2020 are not supported or tested.
 

@@ -6,22 +6,24 @@ Shift Z Continued is an open-source flight data overlay for Microsoft Flight Sim
 
 1. Download the installation ZIP and extract it.
 2. Copy the `shift-z-continued` folder into your MSFS 2024 `Community2024` folder, keeping its contents together.
-3. Start or restart MSFS 2024, enter a flight, and open **Shift Z Continued** from the in-game toolbar.
+3. Start or restart MSFS 2024 and enter a flight. This experimental branch attempts to load the overlay automatically, initially blank; press **Shift+Z** to show it. Automatic loading remains unverified in the simulator.
 
 To uninstall, remove the `shift-z-continued` folder from `Community2024`.
 
 ## Using the overlay
 
-With the panel open and receiving keyboard input, press **Shift+Z** to cycle through:
+This branch (`experimental/wasm-hotkey`) tests automatic panel loading plus simulator-wide Shift+Z input through WASM. With the simulator focused, press **left or right Shift+Z** to cycle from the initial blank view through:
 
 1. Flight data: latitude, longitude, altitude, magnetic heading, indicated airspeed and wind.
 2. Performance data: frame rate, G-force, fuel percentage and simulation rate.
 3. Both lines together.
 4. A blank view.
 
-If Shift+Z also triggers a simulator command, check the active control profile in MSFS and reassign or remove the conflicting binding. The shortcut is not global and does not open the panel automatically. Frame rate is read through a WASM module using SimConnect frame events; `N/A` indicates that a current value is unavailable.
+If Shift+Z also triggers a simulator command, check the active control profile in MSFS and reassign or remove the conflicting binding. The experimental shortcut uses SimConnect input mapping in the existing WASM module and sends `SHIFT_Z_CONTINUED_CYCLE` over CommBus to JS. Panel registration attempts automatic loading independently of the toolbar; JS starts blank. This still needs validation in MSFS. It does not add a Controls menu entry. Frame rate is read through the same WASM module using SimConnect frame events; `N/A` indicates that a current value is unavailable.
 
-The overlay is intended for MSFS 2024. Positioning and keyboard focus may vary with simulator settings; VR and MSFS 2020 have not been tested. Automatic panel startup, persistent visibility and configurable fields are not implemented.
+The DOM keyboard handler is removed to prevent double cycling. If WASM input registration fails, FPS continues but there is no keyboard fallback. Simulator pauses can delay CommBus messages until resume. See [experimental test checklist](docs/experimental-wasm-hotkey.md) before treating this as a validated global shortcut.
+
+The overlay is intended for MSFS 2024. Automatic panel startup is experimental. Positioning may vary with simulator settings; VR and MSFS 2020 have not been tested. Persistent visibility and configurable fields are not implemented.
 
 ## Build from source
 

@@ -1,12 +1,27 @@
 #pragma once
 #include <MSFS/MSFS_WindowsTypes.h>
 using SIMCONNECT_CLIENT_EVENT_ID = unsigned int;
+using SIMCONNECT_INPUT_GROUP_ID = unsigned int;
+using SIMCONNECT_NOTIFICATION_GROUP_ID = unsigned int;
 constexpr int S_OK = 0;
 constexpr int SIMCONNECT_RECV_ID_EVENT_FRAME = 1;
+constexpr int SIMCONNECT_RECV_ID_EVENT = 2;
+constexpr int SIMCONNECT_RECV_ID_EXCEPTION = 3;
+constexpr DWORD SIMCONNECT_GROUP_PRIORITY_STANDARD = 1900000000;
+constexpr DWORD SIMCONNECT_STATE_ON = 1;
 struct SIMCONNECT_RECV { DWORD dwID; };
 struct SIMCONNECT_RECV_EVENT_FRAME : SIMCONNECT_RECV { DWORD uEventID; float fFrameRate; float fSimSpeed; };
+struct SIMCONNECT_RECV_EVENT : SIMCONNECT_RECV { DWORD uEventID; DWORD dwData; };
+struct SIMCONNECT_RECV_EXCEPTION : SIMCONNECT_RECV { DWORD dwException; DWORD dwSendID; DWORD dwIndex; };
 using DispatchProc = void (*)(SIMCONNECT_RECV*, DWORD, void*);
 int SimConnect_Open(HANDLE*, const char*, void*, DWORD, int, DWORD);
 int SimConnect_SubscribeToSystemEvent(HANDLE, SIMCONNECT_CLIENT_EVENT_ID, const char*);
 int SimConnect_CallDispatch(HANDLE, DispatchProc, void*);
 int SimConnect_Close(HANDLE);
+int SimConnect_MapClientEventToSimEvent(HANDLE, SIMCONNECT_CLIENT_EVENT_ID, const char* = nullptr);
+int SimConnect_AddClientEventToNotificationGroup(HANDLE, SIMCONNECT_NOTIFICATION_GROUP_ID, SIMCONNECT_CLIENT_EVENT_ID, int = 0);
+int SimConnect_SetNotificationGroupPriority(HANDLE, SIMCONNECT_NOTIFICATION_GROUP_ID, DWORD);
+int SimConnect_MapInputEventToClientEvent_EX1(HANDLE, SIMCONNECT_INPUT_GROUP_ID, const char*, SIMCONNECT_CLIENT_EVENT_ID, DWORD = 0, SIMCONNECT_CLIENT_EVENT_ID = 0, DWORD = 0, int = 0);
+int SimConnect_SetInputGroupPriority(HANDLE, SIMCONNECT_INPUT_GROUP_ID, DWORD);
+int SimConnect_SetInputGroupState(HANDLE, SIMCONNECT_INPUT_GROUP_ID, DWORD);
+int SimConnect_ClearInputGroup(HANDLE, SIMCONNECT_INPUT_GROUP_ID);

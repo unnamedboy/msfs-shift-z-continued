@@ -18,17 +18,44 @@ namespace {
 
 constexpr SIMCONNECT_CLIENT_EVENT_ID kFrameEvent = 1;
 constexpr SIMCONNECT_CLIENT_EVENT_ID kPauseFrameEvent = 2;
+constexpr SIMCONNECT_CLIENT_EVENT_ID kCycleDownEvent = 3;
+constexpr SIMCONNECT_CLIENT_EVENT_ID kCycleUpEvent = 4;
+constexpr SIMCONNECT_INPUT_GROUP_ID kHotkeyInputGroup = 1;
+constexpr SIMCONNECT_NOTIFICATION_GROUP_ID kHotkeyNotificationGroup = 1;
 constexpr double kBroadcastIntervalSeconds = 0.25;
 constexpr char kFpsMessageName[] = "SHIFT_Z_CONTINUED_FPS";
+constexpr char kCycleMessageName[] = "SHIFT_Z_CONTINUED_CYCLE";
 
 HANDLE connection = 0;
 double elapsedSeconds = 0;
+bool cycleKeyDown = false;
 
 void closeConnection() {
     if (connection) {
         SimConnect_Close(connection);
         connection = 0;
     }
+    cycleKeyDown = false;
+    elapsedSeconds = 0;
+}
+
+bool registerHotkey() {
+    // Private events: no simulator command is invoked and existing bindings are not masked.
+    if (SimConnect_MapClientEventToSimEvent(connection, kCycleDownEvent) != S_OK ||
+        SimConnect_MapClientEventToSimEvent(connection, kCycleUpEvent) != S_OK ||
+        SimConnect_AddClientEventToNotificationGroup(connection, kHotkeyNotificationGroup, kCycleDownEvent) != S_OK ||
+        SimConnect_AddClientEventToNotificationGroup(connection, kHotkeyNotificationGroup, kCycleUpEvent) != S_OK ||
+        SimConnect_SetNotificationGroupPriority(connection, kHotkeyNotificationGroup, SIMCONNECT_GROUP_PRIORITY_STANDARD) != S_OK ||
+        SimConnect_MapInputEventToClientEvent_EX1(connection, kHotkeyInputGroup, "VK_LSHIFT+z", kCycleDownEvent, 0, kCycleUpEvent) != S_OK ||
+        SimConnect_MapInputEventToClientEvent_EX1(connection, kHotkeyInputGroup, "VK_RSHIFT+z", kCycleDownEvent, 0, kCycleUpEvent) != S_OK ||
+        SimConnect_SetInputGroupPriority(connection, kHotkeyInputGroup, SIMCONNECT_GROUP_PRIORITY_STANDARD) != S_OK ||
+        SimConnect_SetInputGroupState(connection, kHotkeyInputGroup, SIMCONNECT_STATE_ON) != S_OK) {
+        SimConnect_ClearInputGroup(connection, kHotkeyInputGroup);
+        std::printf("[ShiftZContinued] Experimental hotkey registration failed; FPS remains available.\n");
+        return false;
+    }
+    std::printf("[ShiftZContinued] Experimental Shift+Z mappings registered.\n");
+    return true;
 }
 
 void broadcastFrameRate(float frameRate) {
@@ -46,7 +73,29 @@ void broadcastFrameRate(float frameRate) {
 }
 
 void CALLBACK onSimConnectMessage(SIMCONNECT_RECV* message, DWORD size, void*) {
-    if (!message || message->dwID != SIMCONNECT_RECV_ID_EVENT_FRAME ||
+    if (!message || size < sizeof(SIMCONNECT_RECV)) return;
+    if (message->dwID == SIMCONNECT_RECV_ID_EXCEPTION && size >= sizeof(SIMCONNECT_RECV_EXCEPTION)) {
+        const auto* error = static_cast<SIMCONNECT_RECV_EXCEPTION*>(message);
+        std::printf("[ShiftZContinued] SimConnect exception %lu (send %lu, index %lu).\n",
+                    static_cast<unsigned long>(error->dwException),
+                    static_cast<unsigned long>(error->dwSendID),
+                    static_cast<unsigned long>(error->dwIndex));
+        return;
+    }
+    if (message->dwID == SIMCONNECT_RECV_ID_EVENT && size >= sizeof(SIMCONNECT_RECV_EVENT)) {
+        const auto* event = static_cast<SIMCONNECT_RECV_EVENT*>(message);
+        if (event->uEventID == kCycleUpEvent) {
+            cycleKeyDown = false;
+        } else if (event->uEventID == kCycleDownEvent && !cycleKeyDown) {
+            cycleKeyDown = true;
+            constexpr char payload[] = "{}";
+            if (!fsCommBusCall(kCycleMessageName, payload, sizeof(payload) - 1, FsCommBusBroadcast_JS)) {
+                std::printf("[ShiftZContinued] Cycle broadcast failed.\n");
+            }
+        }
+        return;
+    }
+    if (message->dwID != SIMCONNECT_RECV_ID_EVENT_FRAME ||
         size < sizeof(SIMCONNECT_RECV_EVENT_FRAME)) {
         return;
     }
@@ -86,6 +135,7 @@ extern "C" MSFS_CALLBACK void module_init() {
     if (SimConnect_SubscribeToSystemEvent(connection, kPauseFrameEvent, "PauseFrame") != S_OK) {
         std::printf("[ShiftZContinued] PauseFrame unavailable; continuing with Frame.\n");
     }
+    registerHotkey();
     std::printf("[ShiftZContinued] FPS module connected.\n");
 }
 

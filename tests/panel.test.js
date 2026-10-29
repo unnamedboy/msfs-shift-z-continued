@@ -37,10 +37,13 @@ const sim = {
     'FUEL TOTAL QUANTITY': 49, 'FUEL TOTAL CAPACITY': 100, 'G FORCE': 1 }[name]; },
   GetGlobalVarValue() { return 1; },
 };
-test('cycles flight, performance, combined, off, and flight', () => {
+test('starts blank and cycles flight, performance, combined, off, and flight over the bus', () => {
   const { text, listeners, events } = createPanel(sim);
   events.get('SHIFT_Z_CONTINUED_FPS')('{"fps":38.2}');
-  const press = () => listeners.get('keydown')({ shiftKey: true, keyCode: 90, repeat: false });
+  assert.equal(listeners.has('keydown'), false);
+  const press = () => events.get('SHIFT_Z_CONTINUED_CYCLE')('{}');
+  assert.equal(text.textContent, '');
+  press();
   assert.match(text.textContent, /LAT: N51° 57\.89'  LON: E4° 27\.94'/);
   assert.equal(text.nodes.filter(node => node.className === 'degree-mark').length, 2);
   assert.match(text.textContent, /ALT: 635 FT MSL  Mag 72  85\.6 KIAS  WIND 357 Mag @ 8 kts\./);
@@ -50,16 +53,18 @@ test('cycles flight, performance, combined, off, and flight', () => {
   press(); assert.equal(text.textContent, '');
   press(); assert.match(text.textContent, /LAT:/);
 });
-test('ignores unrelated or repeated keys and cleans up', () => {
-  const { panel, text, listeners, cleared } = createPanel(sim); const initial = text.textContent;
-  listeners.get('keydown')({ shiftKey: false, keyCode: 90 });
-  listeners.get('keydown')({ shiftKey: true, keyCode: 90, repeat: true });
-  assert.equal(text.textContent, initial); panel.disconnectedCallback();
+test('uses only the bus for cycling and removes both subscriptions on disconnect', () => {
+  const { panel, listeners, events, cleared } = createPanel(sim);
+  assert.equal(listeners.has('keydown'), false);
+  assert.equal(events.size, 2);
+  panel.disconnectedCallback();
+  assert.equal(events.size, 0);
   assert.equal(listeners.has('keydown'), false); assert.equal(cleared(), 42);
 });
 test('FPS accepts valid simulator messages and ignores invalid or stale values', () => {
   const { panel, text, listeners, events } = createPanel(sim);
-  listeners.get('keydown')({ shiftKey: true, keyCode: 90 });
+  events.get('SHIFT_Z_CONTINUED_CYCLE')('{}');
+  events.get('SHIFT_Z_CONTINUED_CYCLE')('{}');
   assert.match(text.textContent, /FRAMES\/SEC = N\/A/);
   const receive = events.get('SHIFT_Z_CONTINUED_FPS');
   receive('{"fps":57.25}'); panel.render();
@@ -72,9 +77,11 @@ test('FPS accepts valid simulator messages and ignores invalid or stale values',
   assert.equal(events.has('SHIFT_Z_CONTINUED_FPS'), false);
 });
 test('unavailable data and FPS show placeholders', () => {
-  const { text, listeners } = createPanel({ GetSimVarValue() { return 0; }, GetGlobalVarValue() { return 1; } });
-  listeners.get('keydown')({ shiftKey: true, code: 'KeyZ' });
+  const { text, events } = createPanel({ GetSimVarValue() { return 0; }, GetGlobalVarValue() { return 1; } });
+  events.get('SHIFT_Z_CONTINUED_CYCLE')('{}');
+  events.get('SHIFT_Z_CONTINUED_CYCLE')('{}');
   assert.match(text.textContent, /FRAMES\/SEC = N\/A/); assert.match(text.textContent, /FUEL N\/A %/);
   const missing = createPanel({ GetSimVarValue() { return NaN; }, GetGlobalVarValue() { throw Error(); } });
+  missing.events.get('SHIFT_Z_CONTINUED_CYCLE')('{}');
   assert.match(missing.text.textContent, /LAT: N\/A/);
 });

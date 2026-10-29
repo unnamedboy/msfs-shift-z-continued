@@ -1,13 +1,14 @@
 const UPDATE_INTERVAL_MS = 250;
 const FPS_TIMEOUT_MS = 3000;
 const FPS_MESSAGE = 'SHIFT_Z_CONTINUED_FPS';
+const CYCLE_MESSAGE = 'SHIFT_Z_CONTINUED_CYCLE';
 const VIEW = { FLIGHT: 0, PERFORMANCE: 1, COMBINED: 2, HIDDEN: 3, COUNT: 4 };
 
 class ShiftZContinued extends UIElement {
   connectedCallback() {
     super.connectedCallback();
     this.statsElement = this.querySelector('#stats');
-    this.view = VIEW.FLIGHT;
+    this.view = VIEW.HIDDEN;
     this.fps = null;
     this.fpsUpdatedAt = 0;
 
@@ -23,19 +24,15 @@ class ShiftZContinued extends UIElement {
       }
     };
 
+    this.onCycle = () => {
+      this.view = (this.view + 1) % VIEW.COUNT;
+      this.render();
+    };
     if (typeof RegisterCommBusListener === 'function') {
       this.commBus = RegisterCommBusListener();
       this.commBus.on(FPS_MESSAGE, this.onFps);
+      this.commBus.on(CYCLE_MESSAGE, this.onCycle);
     }
-
-    this.onKeyDown = event => {
-      const isShiftZ = event.shiftKey && (event.code === 'KeyZ' || event.keyCode === 90);
-      if (isShiftZ && !event.repeat) {
-        this.view = (this.view + 1) % VIEW.COUNT;
-        this.render();
-      }
-    };
-    document.addEventListener('keydown', this.onKeyDown);
     this.updateTimer = setInterval(() => this.render(), UPDATE_INTERVAL_MS);
     this.render();
   }
@@ -44,9 +41,9 @@ class ShiftZContinued extends UIElement {
     clearInterval(this.updateTimer);
     if (this.commBus && typeof this.commBus.off === 'function') {
       this.commBus.off(FPS_MESSAGE, this.onFps);
+      this.commBus.off(CYCLE_MESSAGE, this.onCycle);
     }
     this.commBus = null;
-    document.removeEventListener('keydown', this.onKeyDown);
     super.disconnectedCallback();
   }
 
