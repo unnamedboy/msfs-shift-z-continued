@@ -31,7 +31,6 @@ INSTALLATION
 
 USAGE
 -----
-EXPERIMENTAL WASM HOTKEY BUILD (experimental/wasm-hotkey)
 With the simulator focused, press left or right Shift+Z to cycle, as in FSX:
 
   1. Line 1 (position, altitude, heading, airspeed and wind)
@@ -59,10 +58,7 @@ while the MSFS pause menu is open are dropped.
 
 NOTES / KNOWN LIMITATIONS
 -------------------------
-- This project is experimental and is still being tested in MSFS 2024.
 - FPS may display "N/A" if the accompanying WASM module is unavailable.
-- Automatic panel startup and the WASM hotkeys work in MSFS 2024 tests but
-  are still experimental.
 - The current view (line 1, both, off) is not remembered between flights.
 - The overlay area is sized for 16:9 screens; ultrawide screens are untested.
 - VR and MSFS 2020 are not supported or tested.

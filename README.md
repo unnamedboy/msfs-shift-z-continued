@@ -12,7 +12,7 @@ To uninstall, remove the `shift-z-continued` folder from `Community2024`.
 
 ## Using the overlay
 
-This branch (`experimental/wasm-hotkey`) tests automatic panel loading plus simulator-wide hotkeys through WASM. With the simulator focused, press **left or right Shift+Z** to cycle, as in FS9/FSX/P3D:
+The overlay needs no toolbar button, and its keys work anywhere in the simulator through a WASM module. With the simulator focused, press **left or right Shift+Z** to cycle, as in FS9/FSX/P3D:
 
 1. Line 1: latitude, longitude, altitude, magnetic heading, indicated airspeed and wind.
 2. Both lines: line 1 plus frame rate, G-force, fuel percentage and simulation rate.
@@ -33,7 +33,7 @@ Settings are saved with the simulator's data storage and survive restarts. Outsi
 
 The WASM module maps both shortcuts with SimConnect input events and sends `SHIFT_Z_CONTINUED_CYCLE` or `SHIFT_Z_CONTINUED_CONFIG` over CommBus to JS; it reports detected conflicts as `SHIFT_Z_CONTINUED_CONFLICT`, and the panel sends the player's keys back as `SHIFT_Z_CONTINUED_SET_KEYS`. `src/wasm/watched_commands.h` is generated from the key event tables of the MSFS 2024 SDK documentation with `python tools/gen_watched_commands.py`. If Ctrl+Shift+Z also fires the Shift+Z mapping, the panel treats messages within 250 ms of each other as one key press. Frame rate is read through the same WASM module using SimConnect frame events; `N/A` indicates that a current value is unavailable.
 
-If WASM input registration fails, FPS continues but there is no keyboard fallback. Key presses while the MSFS pause menu is open are dropped. See [experimental test checklist](docs/experimental-wasm-hotkey.md) before treating this as validated.
+If WASM input registration fails, FPS continues but there is no keyboard fallback. Key presses while the MSFS pause menu is open are dropped. Development and simulator test notes: [docs/experimental-wasm-hotkey.md](docs/experimental-wasm-hotkey.md).
 
 The overlay is intended for MSFS 2024. The panel registers as a click-through layer covering a 16:9 screen; on wider screens it may not reach the right edge (untested). VR and MSFS 2020 have not been tested. The view (line 1, both, off) is not remembered between flights.
 
