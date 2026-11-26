@@ -6,22 +6,36 @@ Shift Z Continued is an open-source flight data overlay for Microsoft Flight Sim
 
 1. Download the installation ZIP and extract it.
 2. Copy the `shift-z-continued` folder into your MSFS 2024 `Community2024` folder, keeping its contents together.
-3. Start or restart MSFS 2024, enter a flight, and open **Shift Z Continued** from the in-game toolbar.
+3. Start or restart MSFS 2024 and enter a flight. The overlay loads by itself, without a toolbar button, and starts hidden.
 
 To uninstall, remove the `shift-z-continued` folder from `Community2024`.
 
 ## Using the overlay
 
-With the panel open and receiving keyboard input, press **Shift+Z** to cycle through:
+This branch (`experimental/wasm-hotkey`) tests automatic panel loading plus simulator-wide hotkeys through WASM. With the simulator focused, press **left or right Shift+Z** to cycle, as in FS9/FSX/P3D:
 
-1. Flight data: latitude, longitude, altitude, magnetic heading, indicated airspeed and wind.
-2. Performance data: frame rate, G-force, fuel percentage and simulation rate.
-3. Both lines together.
-4. A blank view.
+1. Line 1: latitude, longitude, altitude, magnetic heading, indicated airspeed and wind.
+2. Both lines: line 1 plus frame rate, G-force, fuel percentage and simulation rate.
+3. Off.
 
-If Shift+Z also triggers a simulator command, check the active control profile in MSFS and reassign or remove the conflicting binding. The shortcut is not global and does not open the panel automatically. Frame rate is read through a WASM module using SimConnect frame events; `N/A` indicates that a current value is unavailable.
+Press **Ctrl+Shift+Z** (either Ctrl and either Shift) to open configuration mode. The text gets a dashed outline and a settings card appears:
 
-The overlay is intended for MSFS 2024. Positioning and keyboard focus may vary with simulator settings; VR and MSFS 2020 have not been tested. Automatic panel startup, persistent visibility and configurable fields are not implemented.
+- Drag the text to move it anywhere on the screen.
+- Click an item to show or hide it.
+- Switch altitude between feet and metres, and speeds between knots and km/h.
+- **Reset position** moves the text back to the top-left corner.
+- **Change key** sets a different combination for cycling or for the settings: Shift, Ctrl or Alt (one or two) with a letter or digit, or F1-F12. While it waits for the keys the button reads **Cancel**; Esc cannot cancel because MSFS opens its pause menu.
+- **Done** or the settings key again closes configuration mode.
+
+When a press of either key also triggers a simulator command, the settings open by themselves with a warning that names the command. Remove that binding in the MSFS keyboard controls, choose another key with **Change key**, or press **Ignore**, which turns off conflict warnings for good, for both keys; the settings offer no way to turn them back on. Detection asks SimConnect to report about 1,500 documented simulator commands (all key events except axes, value setters, debug commands and names the sim rejects), watches which of them fire in the frames around the press, and skips commands that were already firing before it. The warning uses the SimConnect name (for example `AUTORUDDER_TOGGLE`); the MSFS controls may list the same command under a more readable name. Simulator actions that are not key events (some camera and UI actions) cannot be detected.
+
+Settings are saved with the simulator's data storage and survive restarts. Outside configuration mode the overlay ignores the mouse, so clicks reach the cockpit.
+
+The WASM module maps both shortcuts with SimConnect input events and sends `SHIFT_Z_CONTINUED_CYCLE` or `SHIFT_Z_CONTINUED_CONFIG` over CommBus to JS; it reports detected conflicts as `SHIFT_Z_CONTINUED_CONFLICT`, and the panel sends the player's keys back as `SHIFT_Z_CONTINUED_SET_KEYS`. `src/wasm/watched_commands.h` is generated from the key event tables of the MSFS 2024 SDK documentation with `python tools/gen_watched_commands.py`. If Ctrl+Shift+Z also fires the Shift+Z mapping, the panel treats messages within 250 ms of each other as one key press. Frame rate is read through the same WASM module using SimConnect frame events; `N/A` indicates that a current value is unavailable.
+
+If WASM input registration fails, FPS continues but there is no keyboard fallback. Key presses while the MSFS pause menu is open are dropped. See [experimental test checklist](docs/experimental-wasm-hotkey.md) before treating this as validated.
+
+The overlay is intended for MSFS 2024. The panel registers as a click-through layer covering a 16:9 screen; on wider screens it may not reach the right edge (untested). VR and MSFS 2020 have not been tested. The view (line 1, both, off) is not remembered between flights.
 
 ## Build from source
 
