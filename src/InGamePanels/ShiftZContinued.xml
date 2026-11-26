@@ -1,8 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <SimBase.Document Type="InGamePanels" version="1,0">
   <Filename>ShiftZContinued.spb</Filename>
-  <!-- Experimental: mount independently of toolbar activation, initially blank in JS. -->
-  <InGamePanels.InGamePanelDefinition id="PANEL_SHIFT_Z_CONTINUED" Name="shift-z-continued" url="html_ui/InGamePanels/ShiftZContinued/index.html" resizeDirections="both" minWidth="20" minHeight="5" defaultWidth="180" defaultHeight="12" defaultTop="0" defaultRight="0" icon="ICON_SHIFT_Z_CONTINUED" buttonVisible="false" managedByToolbar="false" headerVisible="false" DependsOnToolBarAction="false">
+  <!-- Experimental: a click-through panel covering the screen, mounted without the toolbar.
+       JS starts in the off view and positions the text itself, so the panel anchor does not decide where it appears.
+       Sizes are percent of screen height: 178 wide covers a 16:9 screen. The game sizes the panel window and the
+       ingame-ui template reports its height back; without resizeDirections="both" the game started at minHeight (5)
+       and the panel stayed a 54 px strip, so minHeight is also 100. -->
+  <InGamePanels.InGamePanelDefinition id="PANEL_SHIFT_Z_CONTINUED" Name="shift-z-continued" url="html_ui/InGamePanels/ShiftZContinued/index.html" resizeDirections="both" minWidth="20" minHeight="100" defaultWidth="178" defaultHeight="100" defaultTop="0" defaultLeft="0" icon="ICON_SHIFT_Z_CONTINUED" buttonVisible="false" managedByToolbar="false" headerVisible="false" noBackground="true" isPanelCloseable="false" DependsOnToolBarAction="false">
     <ShowOnEvent>CHAIN_MESSAGE_FLIGHT_END_LOADING</ShowOnEvent>
   </InGamePanels.InGamePanelDefinition>
 </SimBase.Document>
