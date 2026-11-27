@@ -78,8 +78,8 @@ the sim rejected.
 - Ctrl+Shift+Z did not also fire the Shift+Z mapping in any test, so the keys need no overlap handling.
 - Key presses while the Esc pause menu is open are dropped, not delayed. Esc itself opens that menu, so a key
   capture is cancelled with the button.
-- In the settings card a click on Change key/Cancel did not always arrive while a capture was armed; the button
-  also acts on mousedown.
+- In the settings card a click on Change key/Cancel or a unit button did not always arrive; those buttons also
+  act on mousedown.
 - The panel's data storage is attached only at `dataStorageReady`; settings are read again then.
 
 ## Simulator checks

@@ -404,8 +404,8 @@ class ShiftZContinued extends UIElement {
       parent.appendChild(element);
       return element;
     };
-    // In the sim a click on the Change key/Cancel button did not always arrive while a capture was armed,
-    // so those buttons act on mousedown; the click that belongs to that mousedown is skipped.
+    // In the sim a click on the Change key/Cancel and unit buttons did not always arrive, so those buttons
+    // act on mousedown; the click that belongs to that mousedown is skipped.
     const addButton = (parent, text, action, onPress = false) => {
       const button = addElement(parent, 'div', 'config-button', text);
       let pressed = false;
@@ -442,12 +442,12 @@ class ShiftZContinued extends UIElement {
       this.settings.altitudeUnit = this.settings.altitudeUnit === 'ft' ? 'm' : 'ft';
       this.saveSettings();
       this.render();
-    });
+    }, true);
     this.speedToggle = addButton(units, '', () => {
       this.settings.speedUnit = this.settings.speedUnit === 'kt' ? 'kmh' : 'kt';
       this.saveSettings();
       this.render();
-    });
+    }, true);
     this.keyRows = {};
     this.keyButtons = {};
     Object.keys(HOTKEY_LABELS).forEach(key => {

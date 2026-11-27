@@ -865,6 +865,19 @@ test('malformed messages from the WASM module are ignored', () => {
   assert.equal(comboTextOf(panel.settings.keys.cycle), 'shift+Z');
 });
 
+test('the unit buttons act on mousedown, without a second toggle from the click', () => {
+  const { panel, button } = createPanel(sim);
+  panel.setConfigMode(true);
+  const altitude = button('Altitude: feet');
+  altitude.fire('mousedown', { button: 0 });
+  altitude.fire('click');
+  assert.equal(panel.settings.altitudeUnit, 'm');
+  const speed = button('Speed: knots');
+  speed.fire('mousedown', { button: 0 });
+  speed.fire('click');
+  assert.equal(panel.settings.speedUnit, 'kmh');
+});
+
 test('Change key and Cancel also act on mousedown, without a second toggle from the click', () => {
   const { panel, events, find, key } = createPanel(sim);
   events.get('SHIFT_Z_CONTINUED_CONFIG')('{}');
