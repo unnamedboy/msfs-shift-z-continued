@@ -1,5 +1,5 @@
 # SimConnect names listed in the MSFS 2024 SDK documentation that the sim rejected (NAME_UNRECOGNIZED)
-# when this module mapped them; logged as "Unknown command name ..." in the eleventh test (2026-11-26).
+# when this module mapped them in a simulator test on 2026-11-26.
 # tools/gen_watched_commands.py leaves these out. One name per line.
 ADF_OUTSIDE_SOURCE
 ADVENTURE_ACTION

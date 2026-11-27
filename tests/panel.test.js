@@ -29,7 +29,9 @@ class FakeElement {
 }
 
 const PANEL_DIR = path.join(__dirname, '../src/html_ui/InGamePanels/ShiftZContinued');
-function createPanel(simVar, stored = null, { storageReady = true, commBus = true } = {}) {
+// storageReady: the sim's data storage answers at once. readyEvent: it then also fires dataStorageReady.
+// keysConfirmed: start as if WASM had already confirmed the saved keys, so conflict reports are shown.
+function createPanel(simVar, stored = null, { storageReady = true, readyEvent = storageReady, keysConfirmed = true } = {}) {
   const storage = { ready: storageReady, value: stored };
   const docListeners = new Map();
   const root = new FakeElement();
@@ -61,12 +63,13 @@ function createPanel(simVar, stored = null, { storageReady = true, commBus = tru
     customElements: { define(name, type) { assert.equal(name, 'shift-z-continued'); Panel = type; } },
     setInterval() { return 42; }, clearInterval(id) { cleared = id; }, checkAutoload() {},
   };
-  if (!commBus) delete context.RegisterCommBusListener;
   vm.createContext(context);
   for (const file of ['hotkeys.js', 'panel.js']) {
     vm.runInContext(fs.readFileSync(path.join(PANEL_DIR, file), 'utf8'), context, { filename: file });
   }
   const panel = new Panel(); panel.connectedCallback();
+  if (readyEvent) docListeners.get('dataStorageReady')();
+  panel.keysConfirmed = keysConfirmed;
   const button = label => {
     const all = [];
     const walk = element => { all.push(element); element.children.forEach(child => child instanceof FakeElement && walk(child)); };
@@ -81,7 +84,10 @@ function createPanel(simVar, stored = null, { storageReady = true, commBus = tru
     return all.filter(element => element.className.split(' ').includes(className));
   };
   const key = (keyCode, mods = {}) => docListeners.get('keydown')(Object.assign({ keyCode, preventDefault() {} }, mods));
-  return { panel, text, root, config, docListeners, events, saved, button, find, key, wasmCalls, context,
+  // Answers the newest key request (or the given id) the way the WASM module does.
+  const reply = (result, id = Number(/^id=(\d+);/.exec(wasmCalls.at(-1)[1])[1])) =>
+    events.get('SHIFT_Z_CONTINUED_KEYS_STATUS')(JSON.stringify({ id, result }));
+  return { panel, text, root, config, docListeners, events, saved, button, find, key, wasmCalls, context, reply,
     busReady: () => busReady(), storageReady: makeStorageReady, cleared: () => cleared };
 }
 const sim = {
@@ -142,13 +148,18 @@ test('unavailable data and FPS show placeholders', () => {
   assert.match(missing.text.textContent, /ALT: N\/A FT MSL/);
 });
 
+
+const at = (x, y) => `translate(${x}px, ${y}px)`;
+const comboTextOf = combo => `${[...combo.mods].join(',')}+${combo.key}`;
+const changeKeyButton = (find, index = 0) => find('config-key')[index].children.find(child => child.textContent === 'Change key');
+
 test('stored settings choose fields, metric units and position', () => {
   const stored = JSON.stringify({ x: 40, y: 500, altitudeUnit: 'm', speedUnit: 'kmh',
     fields: { lat: false, lon: false, hdg: false, fps: false, g: false, fuel: false, simrate: false } });
   const { text, events } = createPanel(sim, stored);
   events.get('SHIFT_Z_CONTINUED_CYCLE')('{}');
   assert.equal(text.textContent, 'ALT: 194 M MSL  158.5 KM/H IAS  WIND 357 Mag @ 15 km/h.');
-  assert.equal(text.style.left, '40%'); assert.equal(text.style.top, '95%');
+  assert.equal(text.style.transform, at(400, 460), 'a stored position below the screen is shown at the bottom edge');
   events.get('SHIFT_Z_CONTINUED_CYCLE')('{}');
   assert.equal(text.textContent.includes('\n'), false, 'an empty second line adds no line break');
 });
@@ -158,20 +169,45 @@ test('corrupt or foreign stored settings fall back to defaults per key', () => {
     const { text, events } = createPanel(sim, stored);
     events.get('SHIFT_Z_CONTINUED_CYCLE')('{}');
     assert.match(text.textContent, /^LAT: .* FT MSL .* KIAS/);
-    assert.equal(text.style.left, '1%'); assert.equal(text.style.top, '0.5%');
+    assert.equal(text.style.transform, at(10, 3));
   }
 });
 
-test('Ctrl+Shift+Z firing the Shift+Z mapping too toggles configuration only, in either order', () => {
-  const { panel, root } = createPanel(sim);
-  panel.onCycle(1000);
-  assert.equal(panel.view, 1);
-  panel.onCycle(5000); panel.onConfig(5100); // cycle first
+test('the two keys never suppress each other, however close together', () => {
+  const { panel, root, events } = createPanel(sim);
+  events.get('SHIFT_Z_CONTINUED_CYCLE')('{"press":1}');
+  events.get('SHIFT_Z_CONTINUED_CONFIG')('{"press":2}');
   assert.equal(panel.view, 1); assert.equal(root.classList.contains('config-mode'), true);
-  panel.onConfig(9000); panel.onCycle(9100); // config first
-  assert.equal(panel.view, 1); assert.equal(root.classList.contains('config-mode'), false);
-  panel.onCycle(9400);
-  assert.equal(panel.view, 2, 'a separate press after the window still cycles');
+  events.get('SHIFT_Z_CONTINUED_CONFIG')('{"press":3}');
+  events.get('SHIFT_Z_CONTINUED_CYCLE')('{"press":4}');
+  assert.equal(panel.view, 2); assert.equal(root.classList.contains('config-mode'), false);
+});
+
+test('the keys work while the saved keys are still being sent', () => {
+  const { panel, events, busReady, wasmCalls } = createPanel(sim, JSON.stringify({ x: 30 }));
+  busReady();
+  assert.equal(wasmCalls.length, 1);
+  assert.equal(panel.keyRequest.kind, 'sync');
+  events.get('SHIFT_Z_CONTINUED_CYCLE')('{"press":1}');
+  events.get('SHIFT_Z_CONTINUED_CONFIG')('{"press":2}');
+  assert.equal(panel.view, 1); assert.equal(panel.configMode, true);
+});
+
+test('closing the settings ends a capture and a drag and clears the message', () => {
+  const { panel, text, docListeners, find, key, button, saved } = createPanel(sim, JSON.stringify({ x: 10, y: 10 }));
+  panel.setConfigMode(true);
+  changeKeyButton(find).fire('click');
+  key(90, { ctrlKey: true, shiftKey: true });
+  assert.match(find('config-message')[0].textContent, /already the settings key/);
+  text.fire('mousedown', { button: 0, clientX: 100, clientY: 100 });
+  docListeners.get('mousemove')({ clientX: 200, clientY: 100 });
+  button('Done').fire('click');
+  assert.equal(panel.capturing, null);
+  assert.equal(saved.at(-1).x, 20, 'the drag is saved where it was');
+  docListeners.get('mousemove')({ clientX: 400, clientY: 100 });
+  assert.equal(panel.settings.x, 20, 'and no longer follows the mouse');
+  panel.setConfigMode(true);
+  assert.equal(find('config-message')[0].textContent, '');
 });
 
 test('configuration mode previews both lines while off and drags the text within the screen', () => {
@@ -181,24 +217,50 @@ test('configuration mode previews both lines while off and drags the text within
   assert.match(text.textContent, /^LAT:.*\nFRAMES\/SEC/);
   text.fire('mousedown', { button: 0, clientX: 100, clientY: 100 });
   docListeners.get('mousemove')({ clientX: 300, clientY: 200 });
-  assert.equal(text.style.left, '21%'); assert.equal(text.style.top, '20.5%');
+  assert.equal(text.style.transform, at(210, 103));
   docListeners.get('mousemove')({ clientX: 5000, clientY: -900 });
-  assert.equal(text.style.left, '80%', 'the whole text box stays inside the right edge'); assert.equal(text.style.top, '0%');
+  assert.equal(text.style.transform, at(800, 0), 'the whole text box stays inside the right edge');
   docListeners.get('mousemove')({ clientX: -5000, clientY: 5000 });
-  assert.equal(text.style.left, '0%'); assert.equal(text.style.top, '92%', 'the whole text box stays above the bottom edge');
+  assert.equal(text.style.transform, at(0, 460), 'the whole text box stays above the bottom edge');
   docListeners.get('mouseup')({});
   assert.deepEqual([saved.at(-1).x, saved.at(-1).y], [0, 92]);
   docListeners.get('mousemove')({ clientX: 300, clientY: 300 });
-  assert.equal(text.style.left, '0%', 'moving after release does not drag');
-  panel.onConfig(Date.now() + 1000);
+  assert.equal(text.style.transform, at(0, 460), 'moving after release does not drag');
+  panel.setConfigMode(false);
   assert.equal(text.textContent, '', 'leaving configuration returns to the off view');
+});
+
+test('the text stays on screen when it grows, the screen shrinks or it is wider than the screen', () => {
+  const { panel, text, root } = createPanel(sim, JSON.stringify({ x: 80, y: 92 }));
+  panel.render();
+  assert.equal(text.style.transform, at(800, 460));
+  text.getBoundingClientRect = () => ({ width: 300, height: 80 });  // longer values, more items, metric units
+  panel.render();
+  assert.equal(text.style.transform, at(700, 420));
+  root.getBoundingClientRect = () => ({ width: 800, height: 400 });  // lower resolution
+  panel.render();
+  assert.equal(text.style.transform, at(500, 320));
+  text.getBoundingClientRect = () => ({ width: 900, height: 450 });  // larger than the panel
+  panel.render();
+  assert.equal(text.style.transform, at(0, 0));
+  assert.equal(panel.settings.x, 80, 'the chosen position is kept for when the text fits again');
+});
+
+test('a drag starts from where the text is shown, not from a position held back at the edge', () => {
+  const { panel, text, docListeners } = createPanel(sim, JSON.stringify({ x: 80, y: 0.5 }));
+  text.getBoundingClientRect = () => ({ width: 300, height: 40 });
+  panel.setConfigMode(true);
+  assert.equal(text.style.transform, at(700, 3));
+  text.fire('mousedown', { button: 0, clientX: 500, clientY: 100 });
+  docListeners.get('mousemove')({ clientX: 480, clientY: 100 });
+  assert.equal(text.style.transform, at(680, 3));
 });
 
 test('mousedown outside configuration mode does nothing', () => {
   const { text, docListeners } = createPanel(sim);
   text.fire('mousedown', { button: 0, clientX: 100, clientY: 100 });
   docListeners.get('mousemove')({ clientX: 300, clientY: 200 });
-  assert.equal(text.style.left, '1%');
+  assert.equal(text.style.transform, at(10, 3));
 });
 
 test('settings card toggles fields and units, resets position and closes with Done', () => {
@@ -214,7 +276,7 @@ test('settings card toggles fields and units, resets position and closes with Do
   button('Speed: knots').fire('click');
   assert.equal(saved.at(-1).speedUnit, 'kmh'); assert.match(text.textContent, /KM\/H IAS/);
   button('Reset position').fire('click');
-  assert.equal(text.style.left, '1%'); assert.equal(saved.at(-1).y, 0.5);
+  assert.equal(text.style.transform, at(10, 3)); assert.equal(saved.at(-1).y, 0.5);
   button('Done').fire('click');
   assert.equal(root.classList.contains('config-mode'), false);
   assert.equal(text.textContent, '');
@@ -235,248 +297,645 @@ test('settings stored by an earlier flight load once the sim data storage is rea
   storageReady();
   assert.doesNotMatch(text.textContent, /LAT:/);
   assert.match(text.textContent, /ALT: 194 M MSL/);
-  assert.equal(text.style.left, '30%');
+  assert.equal(text.style.transform, at(300, 3));
   assert.equal(saved.length, 0, 'loading does not write settings back');
 });
 
-test('storage becoming ready does not discard changes made earlier in the flight', () => {
-  const { text, events, storageReady, button } = createPanel(sim, JSON.stringify({ speedUnit: 'kmh' }), { storageReady: false });
+test('nothing done before the saved settings are readable can replace them', () => {
+  const stored = JSON.stringify({ speedUnit: 'kmh', ignoreConflicts: true,
+    keys: { cycle: { mods: ['alt'], key: 'X' }, config: { mods: [], key: 'F9' } } });
+  const { panel, text, events, storageReady, button, saved, wasmCalls, busReady, find, key } =
+    createPanel(sim, stored, { storageReady: false, keysConfirmed: false });
+  busReady();
   events.get('SHIFT_Z_CONTINUED_CONFIG')('{}');
   button('Altitude: feet').fire('click');
+  events.get('SHIFT_Z_CONTINUED_CONFIG')('{}');  // closing the card saves nothing
+  assert.equal(panel.configMode, false);
+  panel.setConfigMode(true);
+  changeKeyButton(find).fire('click');
+  assert.equal(panel.capturing, null, 'no key change before the saved keys are known');
+  assert.match(find('config-message')[0].textContent, /still loading/);
+  const waited = createPanel(sim, null, { readyEvent: false });
+  waited.panel.setConfigMode(true);
+  changeKeyButton(waited.find).fire('click');
+  assert.match(waited.find('config-message')[0].textContent, /still loading/);
+  waited.panel.connectedAt -= 6000;
+  waited.panel.render();
+  assert.equal(waited.find('config-message')[0].textContent, '', 'the notice goes once the settings count as known');
+  key(80, { ctrlKey: true });
+  assert.equal(wasmCalls.length, 0);
+  events.get('SHIFT_Z_CONTINUED_CONFLICT')('{"key":"cycle","press":1,"commands":["SLEW_TOGGLE"]}');
+  assert.equal(panel.conflict, null, 'a report cannot be named or checked against Ignore yet: dropped');
   storageReady();
-  assert.match(text.textContent, /M MSL/);
-  assert.match(text.textContent, /KIAS/, 'the in-flight choice wins over the late stored value');
-});
-
-test('the right-edge limit uses the full text width even when the box shrinks at the edge', () => {
-  const { text, docListeners, events } = createPanel(sim);
-  // Like Coherent: an absolute box shrinks to the space left of it (losing a pixel to rounding at the edge),
-  // while its content keeps its full width.
-  text.scrollWidth = 200;
-  text.getBoundingClientRect = () => {
-    const space = 1000 - parseFloat(text.style.left) / 100 * 1000;
-    return { width: space >= 201 ? 200 : Math.floor(space) - 1, height: 40 };
-  };
-  events.get('SHIFT_Z_CONTINUED_CONFIG')('{}');
-  for (let drag = 1; drag <= 3; drag++) {
-    text.fire('mousedown', { button: 0, clientX: 100, clientY: 100 });
-    for (let move = 0; move < 20; move++) docListeners.get('mousemove')({ clientX: 5000, clientY: 100 });
-    docListeners.get('mouseup')({});
-    assert.equal(text.style.left, '80%', `drag ${drag} keeps the whole text inside`);
-  }
+  assert.equal(saved.length, 0);
+  assert.match(text.textContent, /KM\/H IAS/);
+  assert.equal(comboTextOf(panel.settings.keys.cycle), 'alt+X');
+  assert.equal(panel.settings.ignoreConflicts, true);
+  assert.match(wasmCalls.at(-1)[1], /;watch=0;cycle=VK_LMENU\+X/, 'WASM gets the saved keys and watch setting');
 });
 
 test('key combinations expand to the same SimConnect strings the WASM module uses by default', () => {
   const { context } = createPanel(sim);
   const run = code => vm.runInContext(code, context);
-  assert.equal(run('hotkeySetText(DEFAULT_HOTKEYS)'),
-    'cycle=VK_LSHIFT+Z|VK_LSHIFT+z|VK_RSHIFT+Z|VK_RSHIFT+z;'
+  const defaults = 'cycle=VK_LSHIFT+Z|VK_LSHIFT+z|VK_RSHIFT+Z|VK_RSHIFT+z;'
     + 'config=VK_LCONTROL+VK_LSHIFT+Z|VK_LCONTROL+VK_LSHIFT+z|VK_LCONTROL+VK_RSHIFT+Z|VK_LCONTROL+VK_RSHIFT+z|'
-    + 'VK_RCONTROL+VK_LSHIFT+Z|VK_RCONTROL+VK_LSHIFT+z|VK_RCONTROL+VK_RSHIFT+Z|VK_RCONTROL+VK_RSHIFT+z');
+    + 'VK_RCONTROL+VK_LSHIFT+Z|VK_RCONTROL+VK_LSHIFT+z|VK_RCONTROL+VK_RSHIFT+Z|VK_RCONTROL+VK_RSHIFT+z';
+  assert.equal(run('keyRequestText(7, DEFAULT_HOTKEYS, true)'), `id=7;watch=1;${defaults}`);
+  assert.equal(run('keyRequestText(8, DEFAULT_HOTKEYS, false)'), `id=8;watch=0;${defaults}`);
   const wasmSource = fs.readFileSync(path.join(__dirname, '../src/wasm/fps.cpp'), 'utf8');
   const wasmDefault = [...wasmSource.matchAll(/^\s+"([^"]*)"\s*$|kDefaultKeys\[\] =\s*$|^\s+"([^"]*)";$/gm)]
     .map(match => match[1] || match[2] || '').join('');
-  assert.equal(wasmDefault, run('hotkeySetText(DEFAULT_HOTKEYS)'), 'panel and WASM defaults agree');
+  assert.equal(wasmDefault, defaults, 'panel and WASM defaults agree');
   assert.equal(run("comboDefinitions({ mods: [], key: 'F9' }).join('|')"), 'VK_F9');
-  for (const file of ['hotkeys.js', 'panel.js']) {
-    const source = fs.readFileSync(path.join(PANEL_DIR, file), 'utf8');
-    assert.doesNotMatch(source, /\.flatMap\(|\.flat\(/, `${file}: Coherent GT has no flat/flatMap`);
-  }
-  // The L:var codes match the ones tests/fps_test.cpp decodes.
-  assert.equal(run('hotkeySetCode(DEFAULT_HOTKEYS, 6)'), (4 * 64 + 25) + (5 * 64 + 25) * 512 + 7 * 262144);
-  assert.equal(run("hotkeySetCode({ cycle: { mods: ['alt'], key: 'X' }, config: { mods: [], key: 'F9' } }, 999)"),
-    (2 * 64 + 23) + 44 * 512 + 1000 * 262144);
-  assert.equal(run("comboCode({ mods: ['ctrl'], key: '0' })"), 64 + 26);
-  assert.equal(run("comboCode({ mods: ['ctrl', 'alt'], key: 'P' })"), 3 * 64 + 15);
-  assert.equal(run("comboCode({ mods: [], key: 'F12' })"), 47);
   assert.equal(run("comboDefinitions({ mods: ['alt'], key: '5' }).join('|')"), 'VK_LMENU+5|VK_RMENU+5');
   assert.equal(run("comboText(normalizeCombo({ mods: ['shift', 'ctrl'], key: 'x' }))"), 'Ctrl+Shift+X');
   for (const bad of ["{ mods: [], key: 'Z' }", "{ mods: ['ctrl', 'alt', 'shift'], key: 'Z' }", "{ mods: ['win'], key: 'Z' }",
     "{ mods: ['shift', 'shift'], key: 'Z' }", "{ mods: ['shift'], key: 'F13' }", "{ mods: ['shift'], key: '' }", 'null']) {
     assert.equal(run(`normalizeCombo(${bad})`), null, bad);
   }
+  for (const file of ['hotkeys.js', 'panel.js']) {
+    const source = fs.readFileSync(path.join(PANEL_DIR, file), 'utf8');
+    assert.doesNotMatch(source, /\.flatMap\(|\.flat\(/, `${file}: Coherent GT has no flat/flatMap`);
+  }
 });
 
-test('the player keys are sent to WASM when the bus and the stored settings are ready', () => {
+test('the saved keys and the watch setting are sent once the bus and the saved settings are ready', () => {
+  const stored = JSON.stringify({ keys: { cycle: { mods: ['alt'], key: 'X' }, config: { mods: [], key: 'F9' } },
+    ignoreConflicts: true });
+  const late = createPanel(sim, stored, { storageReady: false });
+  late.busReady();
+  assert.equal(late.wasmCalls.length, 0, 'no defaults are sent before the saved settings are known');
+  late.storageReady();
+  assert.equal(late.wasmCalls.at(-1)[0], 'SHIFT_Z_CONTINUED_SET_KEYS');
+  assert.equal(late.wasmCalls.at(-1)[1], 'id=1;watch=0;cycle=VK_LMENU+X|VK_LMENU+x|VK_RMENU+X|VK_RMENU+x;config=VK_F9');
+  assert.equal(late.wasmCalls.length, 1);
+
+  const early = createPanel(sim, stored);
+  early.busReady();
+  assert.match(early.wasmCalls.at(-1)[1], /^id=1;watch=0;cycle=VK_LMENU\+X/, 'readable at once: sent at once');
+
+  const empty = createPanel(sim, null, { readyEvent: false });
+  empty.busReady();
+  empty.panel.setConfigMode(true);
+  empty.button('Latitude').fire('click');
+  assert.equal(empty.wasmCalls.length, 0);
+  assert.equal(empty.saved.length, 0);
+  empty.panel.connectedAt -= 6000;  // the storage never reported ready
+  empty.panel.render();
+  assert.match(empty.wasmCalls.at(-1)[1], /^id=1;watch=1;cycle=VK_LSHIFT\+Z/);
+  assert.equal(empty.saved.at(-1).fields.lat, false, 'the earlier change is saved now');
+  empty.button('Longitude').fire('click');
+  assert.deepEqual([empty.saved.at(-1).fields.lat, empty.saved.at(-1).fields.lon], [false, false]);
+
+  // The storage attaches even later and is still empty: what was chosen meanwhile is written to it.
+  const attached = createPanel(sim, null, { storageReady: false });
+  attached.panel.connectedAt -= 6000;
+  attached.panel.setConfigMode(true);
+  attached.button('Latitude').fire('click');
+  assert.equal(attached.saved.length, 0, 'the write did not reach the storage');
+  attached.storageReady();
+  assert.equal(attached.saved.at(-1).fields.lat, false);
+});
+
+test('an unconfirmed sync is sent again after a pause, three times at most', () => {
   const stored = JSON.stringify({ keys: { cycle: { mods: ['alt'], key: 'X' }, config: { mods: [], key: 'F9' } } });
-  const { wasmCalls, busReady, storageReady } = createPanel(sim, stored, { storageReady: false });
+  const wait = panel => {  // three seconds pass without an answer
+    if (panel.keyRequest) panel.keyRequest.sentAt -= 4000;
+    panel.syncSentAt -= 4000;
+    panel.render();
+  };
+
+  const silent = createPanel(sim, stored);
+  silent.busReady();
+  wait(silent.panel);
+  assert.equal(silent.wasmCalls.length, 2, 'sent again');
+  silent.reply('applied');
+  assert.equal(silent.panel.message, '');
+  assert.equal(silent.panel.syncTries, 0);
+  for (let i = 0; i < 6; i++) wait(silent.panel);
+  assert.equal(silent.wasmCalls.length, 2, 'confirmed: nothing more is sent');
+
+  const dead = createPanel(sim, stored);
+  dead.busReady();
+  for (let i = 0; i < 6; i++) wait(dead.panel);
+  assert.equal(dead.wasmCalls.length, 3);
+  assert.ok(dead.wasmCalls.every(call => /cycle=VK_LMENU\+X/.test(call[1])), 'no answer is not a rejection: no defaults');
+  const notice = dead.find('config-message')[0];
+  assert.match(notice.textContent, /did not confirm the saved keys/);
+  changeKeyButton(dead.find).fire('click');  // start and cancel a capture
+  changeKeyButton(dead.find, 1).fire('click');
+  dead.find('config-key')[1].children.find(child => child.textContent === 'Cancel').fire('click');
+  assert.match(notice.textContent, /did not confirm the saved keys/, 'the notice stays while the keys are unconfirmed');
+  dead.panel.requestSync();
+  dead.panel.render();
+  dead.reply('applied');
+  assert.equal(notice.textContent, '', 'a later confirmed sync removes the notice');
+
+  // A call that throws is no rejection either, and is not repeated at once.
+  const throwing = createPanel(sim, stored);
+  let calls = 0;
+  throwing.panel.commBus.callWasm = () => { calls += 1; throw new Error('no bus'); };
+  throwing.busReady();
+  assert.equal(calls, 1);
+  assert.equal(throwing.panel.keyRequest, null, 'the failed call is finished at once, not left to time out');
+  assert.equal(throwing.panel.syncTries, 1);
+  for (let i = 0; i < 6; i++) wait(throwing.panel);
+  assert.equal(calls, 3);
+  assert.equal(comboTextOf(throwing.panel.settings.keys.cycle), 'alt+X');
+
+  // WASM rejecting the saved keys and the defaults: each of the three attempts is followed by the defaults.
+  const rejecting = createPanel(sim, stored);
+  rejecting.busReady();
+  for (let i = 0; i < 16; i++) {
+    if (rejecting.panel.keyRequest) rejecting.reply('failed');
+    else wait(rejecting.panel);
+  }
+  assert.deepEqual(rejecting.wasmCalls.map(call => /cycle=VK_LMENU/.test(call[1]) ? 'saved' : 'defaults'),
+    ['saved', 'defaults', 'saved', 'defaults', 'saved', 'defaults']);
+  assert.match(rejecting.find('config-message')[0].textContent, /did not confirm the saved keys/);
+
+  // A key change that WASM confirms settles everything: the notice goes and nothing more is sent.
+  const recovered = createPanel(sim, stored);
+  recovered.busReady();
+  for (let i = 0; i < 6; i++) wait(recovered.panel);
+  recovered.panel.setConfigMode(true);
+  changeKeyButton(recovered.find).fire('click');
+  recovered.key(80, { ctrlKey: true });
+  const sends = recovered.wasmCalls.length;
+  recovered.reply('applied');
+  for (let i = 0; i < 3; i++) wait(recovered.panel);
+  assert.equal(recovered.wasmCalls.length, sends);
+  assert.equal(recovered.find('config-message')[0].textContent, '');
+  assert.equal(recovered.find('config-key-text')[0].textContent, 'Cycle key: Ctrl+P');
+
+  // A key change that is not answered after that starts the attempts again, and the notice wins over its message.
+  rejecting.panel.setConfigMode(true);
+  changeKeyButton(rejecting.find).fire('click');
+  rejecting.key(80, { ctrlKey: true });
+  rejecting.panel.keyRequest.sentAt -= 4000;
+  rejecting.panel.render();
+  assert.match(rejecting.find('config-message')[0].textContent, /did not confirm the new key/);
+  assert.match(rejecting.wasmCalls.at(-1)[1], /cycle=VK_LMENU/, 'the saved keys are sent again');
+  for (let i = 0; i < 6; i++) wait(rejecting.panel);
+  assert.match(rejecting.find('config-message')[0].textContent, /did not confirm the saved keys/);
+  assert.equal(comboTextOf(rejecting.panel.settings.keys.cycle), 'alt+X');
+});
+
+test('an invalid answer is a rejection, and a late failure of an older call does not end a newer request', async () => {
+  const stored = JSON.stringify({ keys: { cycle: { mods: ['alt'], key: 'X' }, config: { mods: [], key: 'F9' } } });
+  const invalid = createPanel(sim, stored);
+  invalid.busReady();
+  invalid.reply('invalid');
+  assert.match(invalid.wasmCalls.at(-1)[1], /cycle=VK_LSHIFT\+Z/, 'the defaults are tried');
+  assert.equal(comboTextOf(invalid.panel.settings.keys.cycle), 'alt+X');
+
+  const { panel, busReady, find, key } = createPanel(sim, stored);
+  const rejects = [];
+  panel.commBus.callWasm = () => new Promise((resolve, reject) => rejects.push(reject));
+  busReady();  // the sync call stays open
+  panel.setConfigMode(true);
+  changeKeyButton(find).fire('click');
+  key(80, { ctrlKey: true });  // a newer request
+  const newer = panel.keyRequest;
+  rejects[0](new Error('late'));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(panel.keyRequest, newer);
+  assert.equal(find('config-message')[0].textContent, 'Applying the new key...');
+});
+
+test('a rejected key change that replaced an unanswered send of the saved keys sends them again', () => {
+  const stored = JSON.stringify({ keys: { cycle: { mods: ['alt'], key: 'X' }, config: { mods: [], key: 'F9' } } });
+  const { panel, busReady, find, key, wasmCalls, reply } = createPanel(sim, stored, { keysConfirmed: false });
+  busReady();  // the saved keys are on their way
+  panel.setConfigMode(true);
+  changeKeyButton(find).fire('click');
+  key(80, { ctrlKey: true });
+  reply('failed');  // WASM is back on what it last confirmed, which is not Alt+X
+  assert.match(wasmCalls.at(-1)[1], /cycle=VK_LMENU\+X/);
+  assert.equal(wasmCalls.length, 3);
+  reply('applied');
+  assert.equal(panel.keysConfirmed, true);
+  assert.match(find('config-message')[0].textContent, /did not accept the new key/);
+});
+
+test('a rejected callWasm promise counts as an unconfirmed attempt', async () => {
+  const { panel, busReady } = createPanel(sim, JSON.stringify({ x: 30 }));
+  let calls = 0;
+  panel.commBus.callWasm = () => { calls += 1; return Promise.reject(new Error('no bus')); };
   busReady();
-  assert.deepEqual(wasmCalls.at(-1)[0], 'SHIFT_Z_CONTINUED_SET_KEYS');
-  assert.match(wasmCalls.at(-1)[1], /^cycle=VK_LSHIFT\+Z/, 'defaults before storage is ready');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls, 1);
+  assert.equal(panel.keyRequest, null);
+  assert.equal(panel.syncTries, 1);
+});
+
+test('the sync waits for the bus object when its ready callback runs early', () => {
+  const { panel, wasmCalls, busReady, find, key } = createPanel(sim, JSON.stringify({ x: 30 }));
+  const bus = panel.commBus;
+  panel.commBus = null;  // as if RegisterCommBusListener called back before it returned
+  busReady();
+  assert.equal(wasmCalls.length, 0);
+  panel.setConfigMode(true);
+  changeKeyButton(find).fire('click');
+  key(88, { altKey: true });
+  assert.match(find('config-message')[0].textContent, /not connected; the key was not changed/);
+  assert.equal(comboTextOf(panel.settings.keys.cycle), 'shift+Z');
+  panel.commBus = bus;
+  panel.render();
+  assert.equal(wasmCalls.length, 1);
+});
+
+test('a late storage event without other keys or watch setting sends nothing again', () => {
+  const same = createPanel(sim, JSON.stringify({ x: 40 }), { storageReady: false });
+  same.panel.connectedAt -= 6000;  // the defaults were taken as the settings and sent
+  same.busReady();
+  same.reply('applied');
+  same.storageReady();
+  assert.equal(same.wasmCalls.length, 1);
+  assert.equal(same.panel.settings.x, 40, 'the saved position is still taken over');
+  assert.equal(same.panel.keysConfirmed, true);
+
+  // The same, but the first send is still unanswered: it is dropped with the old settings and sent again.
+  const pending = createPanel(sim, JSON.stringify({ x: 40 }), { storageReady: false, keysConfirmed: false });
+  pending.panel.connectedAt -= 6000;
+  pending.busReady();
+  pending.storageReady();
+  assert.equal(pending.wasmCalls.length, 2);
+  pending.reply('applied');
+  assert.equal(pending.panel.keysConfirmed, true);
+
+  const empty = createPanel(sim, null, { storageReady: false });
+  empty.panel.connectedAt -= 6000;
+  empty.busReady();
+  empty.reply('applied');
+  empty.storageReady();
+  assert.equal(empty.wasmCalls.length, 1);
+});
+
+test('capturing the combination a key already has changes nothing, and its press does not act', () => {
+  const { panel, events, find, key, wasmCalls, saved } = createPanel(sim, JSON.stringify({ x: 30 }));
+  panel.setConfigMode(true);
+  changeKeyButton(find, 1).fire('click');
+  key(90, { ctrlKey: true, shiftKey: true });
+  assert.equal(find('config-message')[0].textContent, 'Ctrl+Shift+Z is already the settings key.');
+  events.get('SHIFT_Z_CONTINUED_CONFIG')('{"press":1}');  // WASM saw the same press
+  assert.equal(panel.configMode, true);
+  assert.equal(panel.capturing, 'config');
+  assert.equal(wasmCalls.length, 0);
+  assert.equal(saved.length, 0);
+});
+
+test('a storage event after the settings were readable changes nothing', () => {
+  const stored = JSON.stringify({ x: 30 });
+  const { panel, find, key, wasmCalls, busReady, reply, storageReady } = createPanel(sim, stored, { readyEvent: false });
+  busReady();
+  reply('applied');
+  panel.setConfigMode(true);
+  changeKeyButton(find).fire('click');
+  key(88, { altKey: true });
+  const calls = wasmCalls.length;
   storageReady();
-  assert.equal(wasmCalls.at(-1)[1], 'cycle=VK_LMENU+X|VK_LMENU+x|VK_RMENU+X|VK_RMENU+x;config=VK_F9');
+  assert.equal(wasmCalls.length, calls);
+  reply('applied');
+  assert.equal(comboTextOf(panel.settings.keys.cycle), 'alt+X');
+});
+
+test('a defaults request that is not answered sends the saved keys again', () => {
+  const stored = JSON.stringify({ keys: { cycle: { mods: ['alt'], key: 'X' }, config: { mods: [], key: 'F9' } } });
+  const { panel, wasmCalls, busReady, reply } = createPanel(sim, stored);
+  busReady();
+  reply('failed');
+  assert.match(wasmCalls.at(-1)[1], /cycle=VK_LSHIFT\+Z/);
+  panel.keyRequest.sentAt -= 4000;
+  panel.syncSentAt -= 4000;
+  panel.render();
+  assert.match(wasmCalls.at(-1)[1], /cycle=VK_LMENU\+X/, 'WASM may have applied the defaults late');
+  assert.equal(comboTextOf(panel.settings.keys.cycle), 'alt+X');
 });
 
 test('stored keys that are invalid or identical fall back to the defaults', () => {
   for (const keys of [{ cycle: { mods: [], key: 'Z' }, config: { mods: ['alt'], key: 'Z' } },
     { cycle: { mods: ['alt'], key: 'Z' }, config: { mods: ['alt'], key: 'z' } }, 'Shift+Z']) {
     const { panel } = createPanel(sim, JSON.stringify({ keys }));
-    assert.equal(panel.settings.keys.cycle.key, 'Z');
-    assert.deepEqual([...panel.settings.keys.cycle.mods], ['shift']);
-    assert.deepEqual([...panel.settings.keys.config.mods], ['ctrl', 'shift']);
+    assert.equal(comboTextOf(panel.settings.keys.cycle), 'shift+Z');
+    assert.equal(comboTextOf(panel.settings.keys.config), 'ctrl,shift+Z');
   }
 });
 
-test('a conflict opens the settings with the command names; Ignore turns off all conflict warnings for good', () => {
-  const { panel, root, find, events, saved } = createPanel(sim);
-  events.get('SHIFT_Z_CONTINUED_CONFLICT')('{"key":"cycle","events":["SLEW_TOGGLE",99,"","AUTORUDDER_TOGGLE"]}');
-  assert.equal(root.classList.contains('config-mode'), true);
-  const warning = find('config-warning')[0];
-  assert.equal(warning.style.display, 'block');
-  assert.match(find('config-warning-text')[0].textContent, /^Shift\+Z also triggers SLEW_TOGGLE, AUTORUDDER_TOGGLE in MSFS\./);
-  find('config-warning')[0].children.find(child => child.textContent === 'Ignore').fire('click');
-  assert.equal(warning.style.display, 'none');
-  assert.equal(saved.at(-1).ignoreConflicts, true);
-  panel.setConfigMode(false);
-  events.get('SHIFT_Z_CONTINUED_CONFLICT')('{"key":"cycle","events":["SLEW_TOGGLE"]}');
-  assert.equal(root.classList.contains('config-mode'), false, 'not reported again');
-  const later = createPanel(sim, JSON.stringify(saved.at(-1)));
-  later.events.get('SHIFT_Z_CONTINUED_CONFLICT')('{"key":"cycle","events":["SLEW_TOGGLE"]}');
-  assert.equal(later.root.classList.contains('config-mode'), false, 'still ignored after a restart');
-  later.events.get('SHIFT_Z_CONTINUED_CONFLICT')('{"key":"config","events":["PAUSE_TOGGLE"]}');
-  assert.equal(later.root.classList.contains('config-mode'), false, 'the other key and other commands are not reported either');
-  const fresh = createPanel(sim);
-  fresh.events.get('SHIFT_Z_CONTINUED_CONFLICT')('{"key":"config","events":["PAUSE_TOGGLE"]}');
-  assert.match(fresh.find('config-warning-text')[0].textContent,
-    /^Ctrl\+Shift\+Z also triggers PAUSE_TOGGLE in MSFS\. .*or press Ignore to stop all key conflict warnings\.$/);
-});
-
-test('malformed conflict messages are ignored', () => {
-  const { root, events } = createPanel(sim);
-  for (const payload of ['{bad', '{"key":"other","events":["A"]}', '{"key":"cycle","events":[]}',
-    '{"key":"cycle","events":[1,""]}', '{"key":"cycle"}', 'null']) {
-    events.get('SHIFT_Z_CONTINUED_CONFLICT')(payload);
-  }
-  assert.equal(root.classList.contains('config-mode'), false);
-});
-
-test('Change key captures a new combination, sends it to WASM and clears that conflict', () => {
-  const { panel, events, button, find, key, wasmCalls, saved } = createPanel(sim);
-  events.get('SHIFT_Z_CONTINUED_CONFLICT')('{"key":"cycle","events":["SLEW_TOGGLE"]}');
-  find('config-key')[0].children.find(child => child.textContent === 'Change key').fire('click');
-  assert.match(find('config-key-text')[0].textContent, /press the new keys/);
+test('a new key is saved only after the WASM module confirms it', () => {
+  const { panel, events, find, key, wasmCalls, saved, reply } = createPanel(sim);
+  events.get('SHIFT_Z_CONTINUED_CONFIG')('{"press":1}');
+  changeKeyButton(find).fire('click');
   assert.match(find('config-message')[0].textContent, /also reach MSFS/);
-  events.get('SHIFT_Z_CONTINUED_CYCLE')('{}');
-  events.get('SHIFT_Z_CONTINUED_CONFIG')('{}');
-  assert.equal(panel.configMode, true, 'hotkeys are ignored while capturing');
-  assert.equal(panel.view, 0);
   key(16, { shiftKey: true });
   assert.equal(panel.capturing, 'cycle', 'a modifier alone keeps waiting');
   key(88);
   assert.match(find('config-message')[0].textContent, /^Use Shift, Ctrl or Alt/);
   key(90, { ctrlKey: true, shiftKey: true });
   assert.match(find('config-message')[0].textContent, /already the settings key/);
+  const savedBefore = saved.length;
   key(88, { altKey: true });
   assert.equal(panel.capturing, null);
-  const viewBefore = panel.view;
-  events.get('SHIFT_Z_CONTINUED_CYCLE')('{}');
-  assert.equal(panel.view, viewBefore, 'a hotkey message arriving right after the capture is ignored');
-  panel.onCycle(Date.now() + 1000);
-  assert.equal(panel.view, (viewBefore + 1) % 3, 'later presses cycle again');
+  assert.match(wasmCalls.at(-1)[1], /^id=\d+;watch=1;cycle=VK_LMENU\+X/);
+  assert.equal(saved.length, savedBefore, 'nothing saved before the answer');
+  assert.equal(comboTextOf(panel.settings.keys.cycle), 'shift+Z');
+  assert.equal(find('config-message')[0].textContent, 'Applying the new key...');
+  // The pressed keys also reach the old mappings in WASM; those messages belong to the capture.
+  events.get('SHIFT_Z_CONTINUED_CYCLE')('{"press":2}');
+  events.get('SHIFT_Z_CONTINUED_CONFIG')('{"press":3}');
+  assert.equal(panel.view, 0); assert.equal(panel.configMode, true);
+  reply('applied');
   assert.equal(find('config-key-text')[0].textContent, 'Cycle key: Alt+X');
-  assert.equal(find('config-warning')[0].style.display, 'none');
   assert.deepEqual(JSON.parse(JSON.stringify(saved.at(-1).keys.cycle)), { mods: ['alt'], key: 'X' });
-  assert.equal(wasmCalls.at(-1)[1].split(';')[0], 'cycle=VK_LMENU+X|VK_LMENU+x|VK_RMENU+X|VK_RMENU+x');
-  assert.match(find('config-hint')[0].textContent, /Ctrl\+Shift\+Z or Done/);
-  const settingsButton = find('config-key')[1].children.find(child => child.textContent === 'Change key');
-  settingsButton.fire('click');
-  assert.equal(settingsButton.textContent, 'Cancel');
-  settingsButton.fire('click');
-  assert.equal(panel.capturing, null);
-  assert.equal(settingsButton.textContent, 'Change key');
-  assert.equal(find('config-key-text')[1].textContent, 'Settings key: Ctrl+Shift+Z', 'Cancel keeps the old key');
-  settingsButton.fire('click');
-  key(27);
-  assert.equal(panel.capturing, null, 'Esc still cancels if it reaches the panel');
+  assert.equal(find('config-message')[0].textContent, '');
+  events.get('SHIFT_Z_CONTINUED_CYCLE')('{"press":4}');
+  assert.equal(panel.view, 1, 'presses after the answer work at once');
+});
+
+test('a rejected or unanswered key change keeps the previous keys; stale answers are ignored', () => {
+  const { panel, find, key, wasmCalls, saved, reply, busReady } = createPanel(sim);
+  busReady();
+  reply('applied');
+  panel.setConfigMode(true);
+  const change = () => {
+    changeKeyButton(find).fire('click');
+    key(80, { ctrlKey: true });
+    return Number(/^id=(\d+);/.exec(wasmCalls.at(-1)[1])[1]);
+  };
+  const first = change();
+  changeKeyButton(find).fire('click');
+  assert.equal(panel.capturing, null, 'no second change while the first is waiting');
+  reply('applied', first - 1);
+  assert.equal(comboTextOf(panel.settings.keys.cycle), 'shift+Z', 'an answer with another id changes nothing');
+  reply('failed', first);
+  assert.equal(comboTextOf(panel.settings.keys.cycle), 'shift+Z');
+  assert.match(find('config-message')[0].textContent, /did not accept the new key; the previous keys stay in use/);
+  assert.equal(saved.filter(entry => entry.keys.cycle.mods.includes('ctrl')).length, 0);
+
+  assert.match(wasmCalls.at(-1)[1], /cycle=VK_LCONTROL\+P/, 'WASM restored the keys itself: nothing is sent again');
+  assert.equal(panel.keyRequest, null);
+  assert.equal(panel.keysConfirmed, true);
+
+  change();
+  panel.keyRequest.sentAt -= 4000;  // no answer within the time limit
+  panel.render();
+  assert.match(find('config-message')[0].textContent, /did not confirm the new key; the previous keys stay in use/);
+  assert.match(wasmCalls.at(-1)[1], /cycle=VK_LSHIFT\+Z/, 'the saved keys are sent again in case WASM applied the new ones');
+  reply('applied');
+  assert.match(find('config-message')[0].textContent, /did not confirm the new key/, 'the answer to that resend keeps the message');
+  assert.equal(comboTextOf(panel.settings.keys.cycle), 'shift+Z');
+});
+
+test('saved keys the WASM module rejects at start are replaced by the defaults', () => {
+  const stored = JSON.stringify({ keys: { cycle: { mods: ['alt'], key: 'X' }, config: { mods: [], key: 'F9' } } });
+  const { panel, wasmCalls, busReady, reply, saved } = createPanel(sim, stored);
+  busReady();
+  reply('failed');
+  assert.match(wasmCalls.at(-1)[1], /cycle=VK_LSHIFT\+Z/);
+  reply('applied');
+  assert.equal(comboTextOf(panel.settings.keys.cycle), 'shift+Z');
+  assert.equal(comboTextOf(saved.at(-1).keys.cycle), 'shift+Z');
+  assert.match(panel.message, /default keys are back/);
+});
+
+test('a report before the saved settings are known does not open the settings', () => {
+  const { panel, events, root } = createPanel(sim, null, { storageReady: false, keysConfirmed: false });
+  events.get('SHIFT_Z_CONTINUED_CONFLICT')('{"key":"cycle","press":1,"commands":["SLEW_TOGGLE"]}');
+  assert.equal(root.classList.contains('config-mode'), false);
+  assert.equal(panel.conflict, null);
+});
+
+test('a report is dropped while the pressed key is uncertain', () => {
+  const report = '{"key":"cycle","press":9,"commands":["SLEW_TOGGLE"]}';
+  const changing = createPanel(sim, JSON.stringify({ x: 30 }));
+  changing.panel.setConfigMode(true);
+  changeKeyButton(changing.find).fire('click');
+  changing.key(88, { altKey: true });  // waiting for its answer: WASM may already use Alt+X
+  changing.events.get('SHIFT_Z_CONTINUED_CONFLICT')(report);
+  assert.equal(changing.panel.conflict, null);
+
+  // The saved keys were sent but not confirmed yet; once they are, reports are shown.
+  const sending = createPanel(sim, JSON.stringify({ x: 30 }), { keysConfirmed: false });
+  sending.busReady();
+  sending.events.get('SHIFT_Z_CONTINUED_CONFLICT')(report);
+  assert.equal(sending.panel.conflict, null);
+  sending.reply('applied');
+  sending.events.get('SHIFT_Z_CONTINUED_CONFLICT')(report);
+  assert.equal(sending.panel.conflict.key, 'cycle');
+
+  // An unanswered key change leaves WASM's keys uncertain until the saved keys are confirmed again;
+  // a rejected one does not, because WASM put the previous keys back.
+  const unanswered = createPanel(sim, JSON.stringify({ x: 30 }));
+  unanswered.panel.setConfigMode(true);
+  changeKeyButton(unanswered.find).fire('click');
+  unanswered.key(88, { altKey: true });
+  unanswered.panel.keyRequest.sentAt -= 4000;
+  unanswered.panel.render();
+  unanswered.events.get('SHIFT_Z_CONTINUED_CONFLICT')(report);
+  assert.equal(unanswered.panel.conflict, null);
+  const rejected = createPanel(sim, JSON.stringify({ x: 30 }));
+  rejected.panel.setConfigMode(true);
+  changeKeyButton(rejected.find).fire('click');
+  rejected.key(88, { altKey: true });
+  rejected.reply('failed');
+  rejected.events.get('SHIFT_Z_CONTINUED_CONFLICT')(report);
+  assert.equal(rejected.panel.conflict.key, 'cycle');
+
+  const unconfirmed = createPanel(sim, JSON.stringify({ x: 30 }));
+  unconfirmed.busReady();
+  for (let i = 0; i < 6; i++) {
+    if (unconfirmed.panel.keyRequest) unconfirmed.panel.keyRequest.sentAt -= 4000;
+    unconfirmed.panel.syncSentAt -= 4000;
+    unconfirmed.panel.render();
+  }
+  unconfirmed.events.get('SHIFT_Z_CONTINUED_CONFLICT')(report);
+  assert.equal(unconfirmed.root.classList.contains('config-mode'), false);
+});
+
+test('a possible conflict opens the settings with the command names', () => {
+  const { find, events, root } = createPanel(sim);
+  events.get('SHIFT_Z_CONTINUED_CONFLICT')('{"key":"cycle","press":1,"commands":["SLEW_TOGGLE",99,"","AUTORUDDER_TOGGLE"]}');
+  assert.equal(root.classList.contains('config-mode'), true);
+  assert.equal(find('config-warning')[0].style.display, 'block');
+  assert.equal(find('config-warning-text')[0].textContent,
+    'Shift+Z may also trigger SLEW_TOGGLE, AUTORUDDER_TOGGLE in MSFS: they ran right after the key press. If so, '
+    + 'remove that binding in the MSFS keyboard controls, change the key below, or press Ignore to stop all key '
+    + 'conflict warnings.');
+});
+
+test('the warning names the current key, and a change of the other key keeps it', () => {
+  const stored = JSON.stringify({ keys: { cycle: { mods: ['alt'], key: 'X' }, config: { mods: [], key: 'F9' } } });
+  const { panel, events, find, key, reply } = createPanel(sim, stored);
+  events.get('SHIFT_Z_CONTINUED_CONFLICT')('{"key":"cycle","press":1,"commands":["SLEW_TOGGLE"]}');
+  assert.match(find('config-warning-text')[0].textContent, /^Alt\+X may also trigger SLEW_TOGGLE in MSFS: it ran/);
+  changeKeyButton(find, 1).fire('click');
+  key(119);  // F8 for the settings key
+  reply('applied');
+  assert.equal(find('config-key-text')[1].textContent, 'Settings key: F8');
+  assert.equal(find('config-warning')[0].style.display, 'block');
+  assert.equal(panel.conflict.key, 'cycle');
+});
+
+test('closing the settings drops the warning', () => {
+  const { panel, events, find, button } = createPanel(sim);
+  events.get('SHIFT_Z_CONTINUED_CONFLICT')('{"key":"cycle","press":1,"commands":["SLEW_TOGGLE"]}');
+  assert.equal(find('config-warning')[0].style.display, 'block');
   button('Done').fire('click');
-  assert.equal(panel.configMode, false);
+  panel.setConfigMode(true);
+  assert.equal(panel.conflict, null);
+  assert.equal(find('config-warning')[0].style.display, 'none');
 });
 
-test('the card shows which path delivered the keys to WASM', async () => {
-  const lvarWrites = [];
-  const simWithWrites = Object.assign({}, sim, {
-    SetSimVarValue(name, unit, value) {
-      lvarWrites.push([name, unit, value]);
-      return Promise.reject([{ message: 'no such var' }]);
-    },
-  });
-  const { panel, events, busReady, find } = createPanel(simWithWrites);
+test('a press swallowed by a key capture still counts for late reports', () => {
+  const { panel, events, find, button, root } = createPanel(sim, JSON.stringify({ x: 30 }));
+  panel.setConfigMode(true);
+  changeKeyButton(find).fire('click');
+  events.get('SHIFT_Z_CONTINUED_CYCLE')('{"press":5}');
+  assert.equal(panel.view, 0);
+  button('Done').fire('click');
+  events.get('SHIFT_Z_CONTINUED_CONFLICT')('{"key":"cycle","press":5,"commands":["SLEW_TOGGLE"]}');
+  assert.equal(root.classList.contains('config-mode'), false);
+});
+
+test('a late report for a press made before the settings were closed does not open them again', () => {
+  const { panel, events, root } = createPanel(sim);
+  events.get('SHIFT_Z_CONTINUED_CONFIG')('{"press":5}');  // open
+  events.get('SHIFT_Z_CONTINUED_CONFIG')('{"press":6}');  // close
+  events.get('SHIFT_Z_CONTINUED_CONFLICT')('{"key":"config","press":6,"commands":["PAUSE_TOGGLE"]}');
+  assert.equal(root.classList.contains('config-mode'), false);
+  assert.equal(panel.conflict, null);
+  events.get('SHIFT_Z_CONTINUED_CYCLE')('{"press":7}');
+  events.get('SHIFT_Z_CONTINUED_CONFLICT')('{"key":"cycle","press":7,"commands":["SLEW_TOGGLE"]}');
+  assert.equal(root.classList.contains('config-mode'), true, 'a later press is reported');
+});
+
+test('a key change clears the warning for that key once it is confirmed', () => {
+  const { panel, events, find, key, reply } = createPanel(sim);
+  events.get('SHIFT_Z_CONTINUED_CONFLICT')('{"key":"cycle","press":1,"commands":["SLEW_TOGGLE"]}');
+  changeKeyButton(find).fire('click');
+  key(88, { altKey: true });
+  assert.equal(find('config-warning')[0].style.display, 'block', 'still shown until the new key is confirmed');
+  reply('applied');
+  assert.equal(find('config-warning')[0].style.display, 'none');
+  assert.equal(panel.conflict, null);
+});
+
+test('Ignore turns off conflict warnings for good and stops the watch in the WASM module', () => {
+  const { panel, root, find, events, saved, wasmCalls, busReady, reply, key } = createPanel(sim);
   busReady();
-  events.get('SHIFT_Z_CONTINUED_CONFIG')('{}');
-  assert.equal(lvarWrites.at(-1)[0], 'L:SHIFT_Z_CONTINUED_KEYS');
-  assert.equal(lvarWrites.at(-1)[1], 'number');
-  assert.equal(lvarWrites.at(-1)[2] % 262144, (4 * 64 + 25) + (5 * 64 + 25) * 512);
-  const link = find('config-link')[0];
-  assert.equal(link.textContent, '', 'nothing to report while a path may still deliver');
-  assert.equal(link.style.display, 'none');
-  await new Promise(resolve => setImmediate(resolve));
-  const sentAt = panel.keyLink.sentAt;
-  assert.equal(panel.keyLinkText(sentAt + 1000), '', 'CommBus may still answer');
-  assert.equal(panel.keyLinkText(sentAt + 3001),
-    'The new keys did not reach the add-on (CommBus no reply, LVar call failed: [{"message":"no such var"}]).');
-  events.get('SHIFT_Z_CONTINUED_KEYS_STATUS')('{"via":"other","result":"applied"}');
+  reply('applied');
+  events.get('SHIFT_Z_CONTINUED_CONFLICT')('{"key":"cycle","press":1,"commands":["SLEW_TOGGLE"]}');
+  find('config-warning')[0].children.find(child => child.textContent === 'Ignore').fire('click');
+  assert.equal(find('config-warning')[0].style.display, 'none');
+  assert.equal(saved.at(-1).ignoreConflicts, true);
+  assert.match(wasmCalls.at(-1)[1], /^id=\d+;watch=0;/);
+  reply('applied');
+  assert.equal(panel.keysConfirmed, true);
+  panel.setConfigMode(false);
+  events.get('SHIFT_Z_CONTINUED_CONFLICT')('{"key":"config","press":9,"commands":["PAUSE_TOGGLE"]}');
+  assert.equal(root.classList.contains('config-mode'), false);
+  const later = createPanel(sim, JSON.stringify(saved.at(-1)));
+  later.busReady();
+  assert.match(later.wasmCalls.at(-1)[1], /^id=1;watch=0;/, 'the watch stays off after a restart');
+
+  // Ignore pressed while a key change waits: the change is not replaced, the watch stops afterwards.
+  const busy = createPanel(sim);
+  busy.busReady();
+  busy.reply('applied');
+  busy.events.get('SHIFT_Z_CONTINUED_CONFLICT')('{"key":"cycle","press":1,"commands":["SLEW_TOGGLE"]}');
+  changeKeyButton(busy.find).fire('click');
+  busy.key(88, { altKey: true });
+  const change = busy.wasmCalls.at(-1)[1];
+  busy.find('config-warning')[0].children.find(child => child.textContent === 'Ignore').fire('click');
+  assert.equal(busy.wasmCalls.at(-1)[1], change);
+  busy.reply('applied');
+  assert.equal(comboTextOf(busy.panel.settings.keys.cycle), 'alt+X');
+  assert.match(busy.wasmCalls.at(-1)[1], /;watch=0;cycle=VK_LMENU\+X/);
+});
+
+test('malformed messages from the WASM module are ignored', () => {
+  const { panel, root, events } = createPanel(sim);
+  for (const payload of ['{bad', '{"key":"other","press":1,"commands":["A"]}', '{"key":"cycle","press":1,"commands":[]}',
+    '{"key":"cycle","press":1,"commands":[1,""]}', '{"key":"cycle"}', 'null']) {
+    events.get('SHIFT_Z_CONTINUED_CONFLICT')(payload);
+  }
   events.get('SHIFT_Z_CONTINUED_KEYS_STATUS')('{bad');
-  assert.match(panel.keyLinkText(sentAt + 3001), /^The new keys did not reach/, 'malformed statuses change nothing');
-  events.get('SHIFT_Z_CONTINUED_KEYS_STATUS')('{"via":"commbus","result":"applied"}');
-  assert.equal(panel.keyLinkText(sentAt + 3001), '', 'one path applied is enough');
-  const before = lvarWrites.at(-1)[2];
-  panel.sendKeys(1000);
-  assert.notEqual(lvarWrites.at(-1)[2], before, 'every send writes a new value');
-  assert.equal(lvarWrites.at(-1)[2] % 262144, before % 262144);
-  events.get('SHIFT_Z_CONTINUED_KEYS_STATUS')('{"via":"commbus","result":"invalid"}');
-  events.get('SHIFT_Z_CONTINUED_KEYS_STATUS')('{"via":"lvar","result":"failed"}');
-  assert.equal(link.textContent, 'The new keys did not reach the add-on (CommBus invalid, LVar failed).');
-  assert.equal(link.style.display, 'block');
+  events.get('SHIFT_Z_CONTINUED_KEYS_STATUS')('{"id":99,"result":"applied"}');
+  assert.equal(root.classList.contains('config-mode'), false);
+  assert.equal(comboTextOf(panel.settings.keys.cycle), 'shift+Z');
 });
 
-test('a send never repeats the value already in the L:var', () => {
-  let stored = null;
-  const writes = [];
-  const lvarSim = Object.assign({}, sim, {
-    GetSimVarValue(name, unit) { return name === 'L:SHIFT_Z_CONTINUED_KEYS' ? stored : sim.GetSimVarValue(name, unit); },
-    SetSimVarValue(name, unit, value) { writes.push(value); stored = value; },
-  });
-  const { panel, context } = createPanel(lvarSim);
-  const code = counter => context.hotkeySetCode(panel.settings.keys, counter);
-  panel.keySendCount = 41;
-  stored = code(42);
-  panel.sendKeys();
-  assert.equal(writes.at(-1), code(43), 'the counter skips the stored value');
-  panel.sendKeys();
-  assert.equal(writes.at(-1), code(44));
-});
-
-test('without CommBus the keys still go through the L:var', () => {
-  const writes = [];
-  const { panel } = createPanel(Object.assign({}, sim, { SetSimVarValue(name, unit, value) { writes.push(value); } }),
-    null, { commBus: false });
-  panel.sendKeys(0);
-  assert.equal(writes.length, 1);
-  assert.equal(panel.keyLink.commbus, 'unavailable');
-  assert.equal(panel.keyLinkText(3001), 'The new keys did not reach the add-on (CommBus unavailable, LVar no reply).');
-});
-
-test('without SimVar.SetSimVarValue the L:var path shows as unavailable', () => {
-  const { panel, events, busReady, find } = createPanel(sim);
-  busReady();
-  events.get('SHIFT_Z_CONTINUED_CONFIG')('{}');
-  assert.equal(find('config-link')[0].textContent, '');
-  assert.equal(panel.keyLinkText(panel.keyLink.sentAt + 3001),
-    'The new keys did not reach the add-on (CommBus no reply, LVar unavailable).');
+test('the unit buttons act on mousedown, without a second toggle from the click', () => {
+  const { panel, button } = createPanel(sim);
+  panel.setConfigMode(true);
+  const altitude = button('Altitude: feet');
+  altitude.fire('mousedown', { button: 0 });
+  altitude.fire('click');
+  assert.equal(panel.settings.altitudeUnit, 'm');
+  const speed = button('Speed: knots');
+  speed.fire('mousedown', { button: 0 });
+  speed.fire('click');
+  assert.equal(panel.settings.speedUnit, 'kmh');
 });
 
 test('Change key and Cancel also act on mousedown, without a second toggle from the click', () => {
-  const { panel, events, find } = createPanel(sim);
+  const { panel, events, find, key } = createPanel(sim);
   events.get('SHIFT_Z_CONTINUED_CONFIG')('{}');
-  const cycleButton = find('config-key')[0].children.find(child => child.textContent === 'Change key');
+  const cycleButton = changeKeyButton(find);
   cycleButton.fire('mousedown', { button: 0 });
   assert.equal(panel.capturing, 'cycle');
   cycleButton.fire('click');
-  assert.equal(panel.capturing, 'cycle', 'the click after the mousedown is skipped');
+  assert.equal(panel.capturing, 'cycle', 'the click after the mousedown is skipped, however long the button was held');
+  cycleButton.fire('click');
+  assert.equal(panel.capturing, null, 'a click without a mousedown acts');
+  cycleButton.fire('mousedown', { button: 0 });
+  cycleButton.fire('click');
+  assert.equal(panel.capturing, 'cycle');
   assert.equal(cycleButton.textContent, 'Cancel');
   cycleButton.fire('mousedown', { button: 2 });
   assert.equal(panel.capturing, 'cycle', 'right button does nothing');
   cycleButton.fire('mousedown', { button: 0 });
   assert.equal(panel.capturing, null, 'Cancel on mousedown');
   assert.equal(cycleButton.textContent, 'Change key');
+  panel.toggleCapture('config');
+  assert.equal(panel.capturing, 'config');
+  key(27);
+  assert.equal(panel.capturing, null, 'Esc cancels if it reaches the panel');
+});
+
+test('saved settings that arrive late end a drag and clear the message; an armed capture stays armed', () => {
+  const stored = JSON.stringify({ x: 50, y: 50 });
+  const { panel, text, docListeners, find, key, storageReady, saved } = createPanel(sim, stored, { storageReady: false });
+  panel.connectedAt -= 6000;
+  panel.setConfigMode(true);
+  changeKeyButton(find).fire('click');
+  key(88);  // refused: shows the rules
+  assert.equal(panel.capturing, 'cycle');
+  text.fire('mousedown', { button: 0, clientX: 100, clientY: 100 });
+  docListeners.get('mousemove')({ clientX: 160, clientY: 100 });
+  storageReady();
+  assert.equal(panel.capturing, 'cycle', 'so the message of a key press made just before is still swallowed');
+  assert.equal(find('config-message')[0].textContent, 'The keys you press also reach MSFS this once.');
+  docListeners.get('mousemove')({ clientX: 300, clientY: 100 });
+  docListeners.get('mouseup')({});
+  assert.equal(panel.settings.x, 50, 'the saved position is not dragged along');
+  assert.equal(saved.length, 0);
+});
+
+test('saved settings that arrive late also drop a key change still waiting for its answer', () => {
+  const stored = JSON.stringify({ keys: { cycle: { mods: ['alt'], key: 'X' }, config: { mods: [], key: 'F9' } } });
+  const { panel, find, key, wasmCalls, busReady, reply, storageReady, saved } = createPanel(sim, stored, { storageReady: false });
+  panel.connectedAt -= 6000;  // the storage stayed silent, so the defaults count as the settings
+  busReady();
+  reply('applied');
+  panel.setConfigMode(true);
+  changeKeyButton(find).fire('click');
+  key(80, { ctrlKey: true });
+  const waiting = Number(/^id=(\d+);/.exec(wasmCalls.at(-1)[1])[1]);
+  storageReady();
+  reply('applied', waiting);
+  assert.equal(panel.keyRequest.kind, 'sync');
+  assert.equal(comboTextOf(panel.settings.keys.cycle), 'alt+X');
+  assert.equal(saved.length, 0, 'the saved keys were not overwritten');
+  assert.match(wasmCalls.at(-1)[1], /cycle=VK_LMENU\+X/, 'and WASM gets them');
 });

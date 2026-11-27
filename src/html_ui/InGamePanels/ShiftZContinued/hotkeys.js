@@ -49,24 +49,10 @@ function comboDefinitions(combo) {
   return definitions;
 }
 
-function hotkeySetText(keys) {
-  return `cycle=${comboDefinitions(keys.cycle).join('|')};config=${comboDefinitions(keys.config).join('|')}`;
-}
-
-// The key set as one number for L:SHIFT_Z_CONTINUED_KEYS; src/wasm/hotkey_code.h decodes it.
-// One combination: modifiers * 64 + key (Ctrl 1, Alt 2, Shift 4; A-Z 0-25, 0-9 26-35, F1-F12 36-47).
-// The value: cycle + config * 512 + counter * 262144, so each send is a new value.
-const HOTKEY_CODE_KEYS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-const HOTKEY_MODIFIER_BITS = { ctrl: 1, alt: 2, shift: 4 };
-
-function comboCode(combo) {
-  const bits = combo.mods.reduce((sum, mod) => sum + HOTKEY_MODIFIER_BITS[mod], 0);
-  const functionKey = /^F(\d+)$/.exec(combo.key);
-  return bits * 64 + (functionKey ? 35 + Number(functionKey[1]) : HOTKEY_CODE_KEYS.indexOf(combo.key));
-}
-
-function hotkeySetCode(keys, counter) {
-  return comboCode(keys.cycle) + comboCode(keys.config) * 512 + (counter % 1000 + 1) * 262144;
+// The request for the WASM module (parseKeyRequest in src/wasm/hotkey_keys.h).
+function keyRequestText(id, keys, watch) {
+  const definitions = key => comboDefinitions(keys[key]).join('|');
+  return `id=${id};watch=${watch ? 1 : 0};cycle=${definitions('cycle')};config=${definitions('config')}`;
 }
 
 // null: only a modifier so far, keep waiting. { cancel: true }: Esc. Otherwise a candidate to normalize.

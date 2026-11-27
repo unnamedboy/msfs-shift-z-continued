@@ -1,6 +1,5 @@
 #include <MSFS/MSFS.h>
 #include <MSFS/MSFS_CommBus.h>
-#include <MSFS/MSFS_Vars.h>
 #include <MSFS/MSFS_WindowsTypes.h>
 #include <SimConnect.h>
 
@@ -8,7 +7,6 @@
 #include <cstddef>
 #include <cstdio>
 
-#include "hotkey_code.h"
 #include "hotkey_keys.h"
 #include "key_conflicts.h"
 #include "watched_commands.h"
@@ -29,29 +27,23 @@ constexpr SIMCONNECT_CLIENT_EVENT_ID kCycleDownEvent = 3;
 constexpr SIMCONNECT_CLIENT_EVENT_ID kCycleUpEvent = 4;
 constexpr SIMCONNECT_CLIENT_EVENT_ID kConfigDownEvent = 5;
 constexpr SIMCONNECT_CLIENT_EVENT_ID kConfigUpEvent = 6;
-// Conflict detection: SimConnect notifies this module of every command in watched_commands.h (client event
-// kWatchFirstEvent + index), in non-maskable groups of at most 1000 events. The detector works on the index.
-// The groups have the highest priority: an aircraft that masks a command in its own maskable group would
-// otherwise hide it from this module (tenth test: bound keys an airliner handles itself were not seen).
-// fsEventsRegisterKeyEventHandler cannot replace this: in a standalone module the sim treats its handler as
-// belonging to a dirty module and never calls it (see docs/experimental-wasm-hotkey.md).
+// Conflict detection: client event kWatchFirstEvent + i is mapped to kWatchedCommands[i], in non-maskable
+// notification groups of at most 1000 events (a SimConnect limit). The groups have the highest priority,
+// otherwise an aircraft that masks a command in its own group hides it from this module.
+// fsEventsRegisterKeyEventHandler is no alternative: in a standalone module the sim never calls it.
 constexpr SIMCONNECT_CLIENT_EVENT_ID kWatchFirstEvent = 100;
 constexpr SIMCONNECT_NOTIFICATION_GROUP_ID kWatchFirstGroup = 2;
 constexpr size_t kWatchGroupSize = 1000;
 constexpr size_t kWatchGroupCount = (shiftz::kWatchedCommandCount + kWatchGroupSize - 1) / kWatchGroupSize;
-constexpr unsigned long kLoggedExceptions = 5;
 constexpr SIMCONNECT_INPUT_GROUP_ID kHotkeyInputGroup = 1;
 constexpr SIMCONNECT_NOTIFICATION_GROUP_ID kHotkeyNotificationGroup = 1;
 constexpr double kBroadcastIntervalSeconds = 0.25;
 constexpr char kFpsMessageName[] = "SHIFT_Z_CONTINUED_FPS";
 constexpr char kCycleMessageName[] = "SHIFT_Z_CONTINUED_CYCLE";
 constexpr char kConfigMessageName[] = "SHIFT_Z_CONTINUED_CONFIG";
-
 constexpr char kConflictMessageName[] = "SHIFT_Z_CONTINUED_CONFLICT";
 constexpr char kSetKeysMessageName[] = "SHIFT_Z_CONTINUED_SET_KEYS";
 constexpr char kKeysStatusMessageName[] = "SHIFT_Z_CONTINUED_KEYS_STATUS";
-// The panel also writes the key set, encoded as a number (hotkey_code.h), to this L:var.
-constexpr char kKeysLVarName[] = "SHIFT_Z_CONTINUED_KEYS";
 
 // Default Shift+Z / Ctrl+Shift+Z for both modifier sides. The SDK lists upper-case letters but its example
 // uses lower case, so both are mapped; duplicate down events are absorbed by the held-key latches.
@@ -62,30 +54,48 @@ constexpr char kDefaultKeys[] =
 constexpr SIMCONNECT_CLIENT_EVENT_ID kHotkeyEvents[] = {
     kCycleDownEvent, kCycleUpEvent, kConfigDownEvent, kConfigUpEvent,
 };
-constexpr int kCycleKey = 0;
-constexpr int kConfigKey = 1;
+
+// A key change is confirmed only after SimConnect has processed the mapping calls: invalid input strings
+// are reported later as exceptions, not as failed calls. A system state request sent after the mappings
+// is answered after those exceptions.
+struct KeyChange {
+    bool active = false;
+    unsigned id = 0;             // the panel's request id, echoed in the reply
+    DWORD check = 0;             // id of the system state request that ends the change
+    DWORD lastSendBefore = 0;    // exceptions for later packets belong to this change
+    bool failed = false;
+    shiftz::HotkeySet keys;
+};
 
 HANDLE connection = 0;
-double elapsedSeconds = 0;
 bool cycleKeyDown = false;
 bool configKeyDown = false;
-bool hotkeyEventsReady = false;
+unsigned pressCount = 0;
+shiftz::HotkeySet currentKeys;  // the mappings in effect
+KeyChange keyChange;
+DWORD checkRequests = 0;
+bool watching = false;
+bool watchMapped = false;
 shiftz::KeyConflictDetector conflicts;
-FsLVarId keysLVar = FS_VAR_INVALID_ID;
-FsUnitId numberUnit = FS_INVALID_UNIT;
-double lastKeysValue = 0;
-unsigned long simConnectExceptions = 0;
-unsigned long loggedExceptions = 0;  // other exceptions are logged up to kLoggedExceptions
-DWORD watchMapSends[shiftz::kWatchedCommandCount] = {};  // packet id of each name mapping, to name unknown ones
+bool frameSincePauseFrame = false;
+double broadcastSeconds = 0;
 
-// Logs each SimConnect message type this module does not handle, once, so unexpected messages show up.
-void noteUnhandledMessage(DWORD id) {
-    static bool seen[64] = {};
-    static bool seenLarger = false;  // ids of 64 and above are logged once in total
-    bool& flag = id < 64 ? seen[id] : seenLarger;
-    if (flag) return;
-    flag = true;
-    std::printf("[ShiftZContinued] SimConnect message type %lu not handled.\n", static_cast<unsigned long>(id));
+void sendMessage(const char* name, const char* payload, int length) {
+    if (length > 0 && !fsCommBusCall(name, payload, static_cast<unsigned int>(length), FsCommBusBroadcast_JS)) {
+        std::printf("[ShiftZContinued] %s broadcast failed.\n", name);
+    }
+}
+
+void sendKeysStatus(unsigned id, const char* result) {
+    char payload[64];
+    const int length = std::snprintf(payload, sizeof(payload), "{\"id\":%u,\"result\":\"%s\"}", id, result);
+    if (length < static_cast<int>(sizeof(payload))) sendMessage(kKeysStatusMessageName, payload, length);
+}
+
+void sendPress(const char* name, unsigned press) {
+    char payload[32];
+    const int length = std::snprintf(payload, sizeof(payload), "{\"press\":%u}", press);
+    if (length < static_cast<int>(sizeof(payload))) sendMessage(name, payload, length);
 }
 
 void closeConnection() {
@@ -95,25 +105,23 @@ void closeConnection() {
     }
     cycleKeyDown = false;
     configKeyDown = false;
-    hotkeyEventsReady = false;
-    elapsedSeconds = 0;
-    for (auto& send : watchMapSends) send = 0;
+    keyChange.active = false;
+    watching = false;
+    watchMapped = false;
     conflicts.reset();
-    keysLVar = FS_VAR_INVALID_ID;
-    lastKeysValue = 0;
-    simConnectExceptions = 0;
-    loggedExceptions = 0;
+    broadcastSeconds = 0;
 }
 
 // Private client events: no simulator command is invoked and existing bindings are not masked.
 bool registerHotkeyEvents() {
     for (const auto event : kHotkeyEvents) {
-        if (SimConnect_MapClientEventToSimEvent(connection, event) != S_OK) return false;
+        if (SimConnect_MapClientEventToSimEvent(connection, event) != S_OK ||
+            SimConnect_AddClientEventToNotificationGroup(connection, kHotkeyNotificationGroup, event) != S_OK) {
+            return false;
+        }
     }
-    for (const auto event : kHotkeyEvents) {
-        if (SimConnect_AddClientEventToNotificationGroup(connection, kHotkeyNotificationGroup, event) != S_OK) return false;
-    }
-    return SimConnect_SetNotificationGroupPriority(connection, kHotkeyNotificationGroup, SIMCONNECT_GROUP_PRIORITY_STANDARD) == S_OK;
+    return SimConnect_SetNotificationGroupPriority(connection, kHotkeyNotificationGroup,
+                                                   SIMCONNECT_GROUP_PRIORITY_STANDARD) == S_OK;
 }
 
 bool mapHotkeys(const shiftz::HotkeySet& keys) {
@@ -131,265 +139,189 @@ bool mapHotkeys(const shiftz::HotkeySet& keys) {
            SimConnect_SetInputGroupState(connection, kHotkeyInputGroup, SIMCONNECT_STATE_ON) == S_OK;
 }
 
-bool applyHotkeys(const shiftz::HotkeySet& keys) {
+bool remapHotkeys(const shiftz::HotkeySet& keys) {
     cycleKeyDown = false;
     configKeyDown = false;
-    if (mapHotkeys(keys)) return true;
     SimConnect_ClearInputGroup(connection, kHotkeyInputGroup);
-    return false;
+    return mapHotkeys(keys);
 }
 
-bool registerHotkey() {
-    shiftz::HotkeySet keys;
-    shiftz::parseHotkeySet(kDefaultKeys, sizeof(kDefaultKeys) - 1, keys);
-    hotkeyEventsReady = registerHotkeyEvents();
-    if (!hotkeyEventsReady || !applyHotkeys(keys)) {
-        hotkeyEventsReady = false;
-        SimConnect_ClearInputGroup(connection, kHotkeyInputGroup);
-        std::printf("[ShiftZContinued] Hotkey registration failed; FPS remains available.\n");
-        return false;
-    }
-    std::printf("[ShiftZContinued] Shift+Z and Ctrl+Shift+Z mappings registered.\n");
-    return true;
+void restoreHotkeys() {
+    if (!remapHotkeys(currentKeys)) std::printf("[ShiftZContinued] Restoring the previous keys failed.\n");
 }
 
-// Tells the panel whether a key set arrived and was applied, and by which path, so problems show in its card.
-void sendKeysStatus(const char* via, const char* result) {
-    char payload[96];
-    const int length = std::snprintf(payload, sizeof(payload), "{\"via\":\"%s\",\"result\":\"%s\"}", via, result);
-    if (length > 0 && static_cast<size_t>(length) < sizeof(payload) &&
-        !fsCommBusCall(kKeysStatusMessageName, payload, static_cast<unsigned int>(length), FsCommBusBroadcast_JS)) {
-        std::printf("[ShiftZContinued] Key status broadcast failed.\n");
-    }
-}
-
-// The panel sends the player's keys at start and after every change, over CommBus and through an L:var.
-void applyKeyText(const char* buffer, unsigned int size, const char* via) {
-    std::printf("[ShiftZContinued] Key set received via %s (%u bytes).\n", via, size);
-    shiftz::HotkeySet keys;
-    if (!connection || !hotkeyEventsReady || !shiftz::parseHotkeySet(buffer, size, keys)) {
-        std::printf("[ShiftZContinued] Ignored invalid key set from the panel.\n");
-        sendKeysStatus(via, "invalid");
+void setWatching(bool on) {
+    if (on == watching) return;
+    watching = on;
+    bool ok = true;
+    if (!on) {
+        for (size_t group = 0; group < kWatchGroupCount; ++group) {
+            ok = SimConnect_ClearNotificationGroup(
+                     connection, static_cast<SIMCONNECT_NOTIFICATION_GROUP_ID>(kWatchFirstGroup + group)) == S_OK && ok;
+        }
+        conflicts.clearPending();
+        std::printf("[ShiftZContinued] Key conflict watch off%s.\n", ok ? "" : " (a call failed)");
         return;
     }
-    SimConnect_ClearInputGroup(connection, kHotkeyInputGroup);
-    if (applyHotkeys(keys)) {
-        std::printf("[ShiftZContinued] Player key set applied.\n");
-        sendKeysStatus(via, "applied");
-        return;
-    }
-    shiftz::HotkeySet defaults;
-    shiftz::parseHotkeySet(kDefaultKeys, sizeof(kDefaultKeys) - 1, defaults);
-    const bool restored = applyHotkeys(defaults);
-    std::printf("[ShiftZContinued] Player key set failed; defaults %s.\n", restored ? "restored" : "unavailable");
-    sendKeysStatus(via, restored ? "failed-defaults" : "failed");
-}
-
-void onSetKeys(const char* buffer, unsigned int size, void*) {
-    applyKeyText(buffer, size, "commbus");
-}
-
-void reportConflicts() {
-    const auto report = conflicts.poll();
-    if (!report.ready) return;
-    const char* key = report.key == kCycleKey ? "cycle" : "config";
-    if (report.count == 0) {
-        std::printf("[ShiftZContinued] Press check (%s): no other command (%lu SimConnect exceptions so far).\n",
-                    key, simConnectExceptions);
-        return;
-    }
-    char payload[512];
-    const int length = shiftz::KeyConflictDetector::format(report, payload, sizeof(payload),
-                                                           shiftz::kWatchedCommands, shiftz::kWatchedCommandCount);
-    std::printf("[ShiftZContinued] Press check (%s): %s\n", key, length > 0 ? payload : "report too long");
-    if (length > 0 &&
-        !fsCommBusCall(kConflictMessageName, payload, static_cast<unsigned int>(length), FsCommBusBroadcast_JS)) {
-        std::printf("[ShiftZContinued] Conflict broadcast failed.\n");
-    }
-}
-
-// Each send changes the value (a counter is part of it), so every send is applied and answered once.
-// A value without the counter part was not written by the panel (the sim showed a 1 during flight loading).
-void pollKeysLVar() {
-    if (keysLVar == FS_VAR_INVALID_ID) return;
-    double value = 0;
-    if (fsVarsLVarGet(keysLVar, numberUnit, &value) != FS_VAR_ERROR_NONE || value == lastKeysValue) return;
-    lastKeysValue = value;
-    if (value < shiftz::kHotkeySetBase) return;
-    char text[512];
-    const size_t length = shiftz::hotkeyTextFromCode(value, text, sizeof(text));
-    if (length == 0) {
-        std::printf("[ShiftZContinued] Ignored invalid key code %.0f from the panel.\n", value);
-        sendKeysStatus("lvar", "invalid");
-        return;
-    }
-    applyKeyText(text, static_cast<unsigned int>(length), "lvar");
-}
-
-// A name the sim does not know comes back later as a SimConnect exception for that event only.
-void watchCommands() {
-    unsigned failed = 0;
+    conflicts.onWatchStart();
     for (size_t i = 0; i < shiftz::kWatchedCommandCount; ++i) {
         const auto event = static_cast<SIMCONNECT_CLIENT_EVENT_ID>(kWatchFirstEvent + i);
+        if (!watchMapped) {
+            ok = SimConnect_MapClientEventToSimEvent(connection, event, shiftz::kWatchedCommands[i]) == S_OK && ok;
+        }
         const auto group = static_cast<SIMCONNECT_NOTIFICATION_GROUP_ID>(kWatchFirstGroup + i / kWatchGroupSize);
-        if (SimConnect_MapClientEventToSimEvent(connection, event, shiftz::kWatchedCommands[i]) != S_OK) {
-            ++failed;
-            continue;
-        }
-        if (SimConnect_GetLastSentPacketID(connection, &watchMapSends[i]) != S_OK) watchMapSends[i] = 0;
-        if (SimConnect_AddClientEventToNotificationGroup(connection, group, event) != S_OK) ++failed;
+        ok = SimConnect_AddClientEventToNotificationGroup(connection, group, event) == S_OK && ok;
     }
+    watchMapped = true;
     for (size_t group = 0; group < kWatchGroupCount; ++group) {
-        if (SimConnect_SetNotificationGroupPriority(connection, static_cast<SIMCONNECT_NOTIFICATION_GROUP_ID>(
-                kWatchFirstGroup + group), SIMCONNECT_GROUP_PRIORITY_HIGHEST) != S_OK) {
-            ++failed;
-        }
+        ok = SimConnect_SetNotificationGroupPriority(connection,
+                 static_cast<SIMCONNECT_NOTIFICATION_GROUP_ID>(kWatchFirstGroup + group),
+                 SIMCONNECT_GROUP_PRIORITY_HIGHEST) == S_OK && ok;
     }
-    std::printf("[ShiftZContinued] Watching %u commands for key conflicts (%u calls failed).\n",
-                static_cast<unsigned>(shiftz::kWatchedCommandCount), failed);
+    std::printf("[ShiftZContinued] Watching %u commands for key conflicts%s.\n",
+                static_cast<unsigned>(shiftz::kWatchedCommandCount), ok ? "" : " (a call failed)");
 }
 
-// The watched command whose name mapping had this packet id, or nullptr.
-const char* watchedCommandForSend(DWORD sendId) {
-    if (sendId == 0) return nullptr;
-    for (size_t i = 0; i < shiftz::kWatchedCommandCount; ++i) {
-        if (watchMapSends[i] == sendId) return shiftz::kWatchedCommands[i];
-    }
-    return nullptr;
-}
-
-void sendKeyMessage(const char* name) {
-    constexpr char payload[] = "{}";
-    if (!fsCommBusCall(name, payload, sizeof(payload) - 1, FsCommBusBroadcast_JS)) {
-        std::printf("[ShiftZContinued] %s broadcast failed.\n", name);
-    }
-}
-
-void broadcastFrameRate(float frameRate) {
-    char payload[64];
-    const int length = std::snprintf(payload, sizeof(payload), "{\"fps\":%.2f}", frameRate);
-    if (length <= 0 || static_cast<size_t>(length) >= sizeof(payload)) {
+// The panel sends the player's keys and the watch setting at start and after every change.
+void onSetKeys(const char* buffer, unsigned int size, void*) {
+    shiftz::KeyRequest request;
+    if (!shiftz::parseKeyRequest(buffer, size, request)) {
+        std::printf("[ShiftZContinued] Ignored an invalid key request from the panel.\n");
+        sendKeysStatus(request.id, "invalid");
         return;
     }
-
-    const bool sent = fsCommBusCall(kFpsMessageName, payload,
-                                    static_cast<unsigned int>(length), FsCommBusBroadcast_JS);
-    if (!sent) {
-        std::printf("[ShiftZContinued] FPS broadcast failed.\n");
+    setWatching(request.watch);
+    // A newer request replaces one still being checked; only the newest is answered.
+    keyChange.active = false;
+    DWORD lastSend = 0;
+    SimConnect_GetLastSentPacketID(connection, &lastSend);
+    if (!remapHotkeys(request.keys) ||
+        SimConnect_RequestSystemState(connection, ++checkRequests, "Sim") != S_OK) {
+        restoreHotkeys();
+        std::printf("[ShiftZContinued] The new keys could not be mapped; previous keys restored.\n");
+        sendKeysStatus(request.id, "failed");
+        return;
     }
+    keyChange.active = true;
+    keyChange.id = request.id;
+    keyChange.check = checkRequests;
+    keyChange.lastSendBefore = lastSend;
+    keyChange.failed = false;
+    keyChange.keys = request.keys;
+}
+
+void finishKeyChange() {
+    keyChange.active = false;
+    conflicts.clearPending();  // presses made while the keys changed are not attributed to either set
+    if (keyChange.failed) {
+        restoreHotkeys();
+        std::printf("[ShiftZContinued] The sim rejected the new keys; previous keys restored.\n");
+        sendKeysStatus(keyChange.id, "failed");
+        return;
+    }
+    currentKeys = keyChange.keys;
+    sendKeysStatus(keyChange.id, "applied");
+}
+
+void onException(const SIMCONNECT_RECV_EXCEPTION& error) {
+    if (keyChange.active && error.dwSendID > keyChange.lastSendBefore) {
+        keyChange.failed = true;
+        return;
+    }
+    std::printf("[ShiftZContinued] SimConnect exception %lu (packet %lu).\n",
+                static_cast<unsigned long>(error.dwException), static_cast<unsigned long>(error.dwSendID));
+}
+
+void onEvent(DWORD eventId) {
+    if (eventId >= kWatchFirstEvent && eventId - kWatchFirstEvent < shiftz::kWatchedCommandCount) {
+        if (watching) conflicts.onCommand(static_cast<int>(eventId - kWatchFirstEvent));
+        return;
+    }
+    // Latches suppress key repeat: one message per press until the matching up event.
+    if (eventId == kCycleUpEvent) {
+        cycleKeyDown = false;
+    } else if (eventId == kConfigUpEvent) {
+        configKeyDown = false;
+    } else if (eventId == kCycleDownEvent && !cycleKeyDown) {
+        cycleKeyDown = true;
+        conflicts.onPress(0, ++pressCount);
+        sendPress(kCycleMessageName, pressCount);
+    } else if (eventId == kConfigDownEvent && !configKeyDown) {
+        configKeyDown = true;
+        conflicts.onPress(1, ++pressCount);
+        sendPress(kConfigMessageName, pressCount);
+    }
+}
+
+void onFrame(float frameRate) {
+    if (!std::isfinite(frameRate) || frameRate <= 0) return;
+    const double seconds = 1.0 / frameRate;
+    conflicts.advance(seconds);
+    const auto report = conflicts.poll();
+    if (report.ready && report.count > 0) {
+        char payload[512];
+        const int length = shiftz::KeyConflictDetector::format(report, shiftz::kWatchedCommands,
+                                                               shiftz::kWatchedCommandCount, payload, sizeof(payload));
+        sendMessage(kConflictMessageName, payload, length);
+    }
+    broadcastSeconds += seconds;
+    if (broadcastSeconds < kBroadcastIntervalSeconds) return;
+    broadcastSeconds = 0;
+    char payload[64];
+    const int length = std::snprintf(payload, sizeof(payload), "{\"fps\":%.2f}", frameRate);
+    if (length < static_cast<int>(sizeof(payload))) sendMessage(kFpsMessageName, payload, length);
 }
 
 void CALLBACK onSimConnectMessage(SIMCONNECT_RECV* message, DWORD size, void*) {
-    if (!message || size < sizeof(SIMCONNECT_RECV)) return;
+    if (!message) return;
     if (message->dwID == SIMCONNECT_RECV_ID_EXCEPTION && size >= sizeof(SIMCONNECT_RECV_EXCEPTION)) {
-        const auto* error = static_cast<SIMCONNECT_RECV_EXCEPTION*>(message);
-        ++simConnectExceptions;
-        const char* unknown = error->dwException == SIMCONNECT_EXCEPTION_NAME_UNRECOGNIZED
-            ? watchedCommandForSend(error->dwSendID) : nullptr;
-        if (unknown) {
-            // Listed in the documentation but unknown to this sim; its notification group entry fails as well.
-            std::printf("[ShiftZContinued] Unknown command name %s; not watched.\n", unknown);
-        } else if (loggedExceptions < kLoggedExceptions) {
-            ++loggedExceptions;
-            std::printf("[ShiftZContinued] SimConnect exception %lu (send %lu, index %lu)%s.\n",
-                        static_cast<unsigned long>(error->dwException),
-                        static_cast<unsigned long>(error->dwSendID),
-                        static_cast<unsigned long>(error->dwIndex),
-                        loggedExceptions == kLoggedExceptions ? ". Further ones are only counted" : "");
+        onException(*static_cast<SIMCONNECT_RECV_EXCEPTION*>(message));
+    } else if (message->dwID == SIMCONNECT_RECV_ID_SYSTEM_STATE && size >= sizeof(SIMCONNECT_RECV) + sizeof(DWORD)) {
+        if (keyChange.active && static_cast<SIMCONNECT_RECV_SYSTEM_STATE*>(message)->dwRequestID == keyChange.check) {
+            finishKeyChange();
         }
-        return;
-    }
-    if (message->dwID == SIMCONNECT_RECV_ID_OPEN) return;
-    // MSFS 2024 can send an event as EVENT_EX1 (five data words), for example one a key binding triggers
-    // with parameters. Both forms carry uEventID. (The ninth test saw key bindings arrive as plain EVENT.)
-    bool isEvent = false;
-    DWORD eventId = 0;
-    if (message->dwID == SIMCONNECT_RECV_ID_EVENT && size >= sizeof(SIMCONNECT_RECV_EVENT)) {
-        isEvent = true;
-        eventId = static_cast<SIMCONNECT_RECV_EVENT*>(message)->uEventID;
-    } else if (message->dwID == SIMCONNECT_RECV_ID_EVENT_EX1 && size >= sizeof(SIMCONNECT_RECV_EVENT_EX1)) {
-        isEvent = true;
-        eventId = static_cast<SIMCONNECT_RECV_EVENT_EX1*>(message)->uEventID;
-    }
-    if (isEvent) {
-        if (eventId >= kWatchFirstEvent && eventId - kWatchFirstEvent < shiftz::kWatchedCommandCount) {
-            conflicts.onKeyEvent(static_cast<int>(eventId - kWatchFirstEvent));
-            return;
+    } else if (message->dwID == SIMCONNECT_RECV_ID_EVENT && size >= sizeof(SIMCONNECT_RECV_EVENT)) {
+        onEvent(static_cast<SIMCONNECT_RECV_EVENT*>(message)->uEventID);
+    } else if (message->dwID == SIMCONNECT_RECV_ID_EVENT_FRAME && size >= sizeof(SIMCONNECT_RECV_EVENT_FRAME)) {
+        const auto* frame = static_cast<SIMCONNECT_RECV_EVENT_FRAME*>(message);
+        // It is not known whether Frame keeps firing while paused, so a PauseFrame counts only when no
+        // Frame arrived since the previous PauseFrame; time is never counted twice.
+        if (frame->uEventID == kFrameEvent) {
+            frameSincePauseFrame = true;
+            onFrame(frame->fFrameRate);
+        } else if (frame->uEventID == kPauseFrameEvent) {
+            if (!frameSincePauseFrame) onFrame(frame->fFrameRate);
+            frameSincePauseFrame = false;
         }
-        // Latches suppress key repeat: one message per press until the matching up event.
-        if (eventId == kCycleUpEvent) {
-            cycleKeyDown = false;
-        } else if (eventId == kCycleDownEvent && !cycleKeyDown) {
-            cycleKeyDown = true;
-            conflicts.onPress(kCycleKey);
-            sendKeyMessage(kCycleMessageName);
-        } else if (eventId == kConfigUpEvent) {
-            configKeyDown = false;
-        } else if (eventId == kConfigDownEvent && !configKeyDown) {
-            configKeyDown = true;
-            conflicts.onPress(kConfigKey);
-            sendKeyMessage(kConfigMessageName);
-        }
-        return;
     }
-    if (message->dwID != SIMCONNECT_RECV_ID_EVENT_FRAME) {
-        noteUnhandledMessage(message->dwID);
-        return;
-    }
-    if (size < sizeof(SIMCONNECT_RECV_EVENT_FRAME)) {
-        return;
-    }
-
-    const auto* frame = static_cast<SIMCONNECT_RECV_EVENT_FRAME*>(message);
-    const bool isFrameEvent = frame->uEventID == kFrameEvent || frame->uEventID == kPauseFrameEvent;
-    if (!isFrameEvent) return;
-    conflicts.onFrame();
-    reportConflicts();
-    pollKeysLVar();
-    if (!std::isfinite(frame->fFrameRate) || frame->fFrameRate <= 0) {
-        return;
-    }
-
-    // Estimate elapsed time from each frame rate and send roughly four updates per second.
-    elapsedSeconds += 1.0 / frame->fFrameRate;
-    if (elapsedSeconds < kBroadcastIntervalSeconds) {
-        return;
-    }
-
-    elapsedSeconds = 0;
-    broadcastFrameRate(frame->fFrameRate);
 }
 
 } // namespace
 
 extern "C" MSFS_CALLBACK void module_init() {
-    std::printf("[ShiftZContinued] FPS module initializing.\n");
-    if (SimConnect_Open(&connection, "Shift Z Continued FPS", nullptr, 0, 0, 0) != S_OK) {
+    if (SimConnect_Open(&connection, "Shift Z Continued", nullptr, 0, 0, 0) != S_OK) {
         std::printf("[ShiftZContinued] SimConnect open failed.\n");
         return;
     }
-
     if (SimConnect_SubscribeToSystemEvent(connection, kFrameEvent, "Frame") != S_OK ||
         SimConnect_CallDispatch(connection, onSimConnectMessage, nullptr) != S_OK) {
         std::printf("[ShiftZContinued] Frame event subscription or dispatch failed.\n");
         closeConnection();
         return;
     }
-
     if (SimConnect_SubscribeToSystemEvent(connection, kPauseFrameEvent, "PauseFrame") != S_OK) {
         std::printf("[ShiftZContinued] PauseFrame unavailable; continuing with Frame.\n");
     }
-    if (registerHotkey()) {
-        watchCommands();
-        if (!fsCommBusRegister(kSetKeysMessageName, onSetKeys, nullptr)) {
-            std::printf("[ShiftZContinued] CommBus key changes unavailable.\n");
-        }
-        numberUnit = fsVarsGetUnitId("number");
-        keysLVar = fsVarsRegisterLVar(kKeysLVarName);
-        std::printf("[ShiftZContinued] Key L:var %s (id %d, unit %d).\n",
-                    keysLVar == FS_VAR_INVALID_ID ? "unavailable" : "registered", keysLVar, numberUnit);
+    shiftz::parseHotkeySet(kDefaultKeys, sizeof(kDefaultKeys) - 1, currentKeys);
+    if (!registerHotkeyEvents() || !mapHotkeys(currentKeys)) {
+        SimConnect_ClearInputGroup(connection, kHotkeyInputGroup);
+        std::printf("[ShiftZContinued] Hotkey registration failed; FPS remains available.\n");
+        return;
     }
-    std::printf("[ShiftZContinued] FPS module connected.\n");
+    if (!fsCommBusRegister(kSetKeysMessageName, onSetKeys, nullptr)) {
+        std::printf("[ShiftZContinued] Key changes unavailable; the default keys stay.\n");
+    }
+    std::printf("[ShiftZContinued] Module ready.\n");
 }
 
 extern "C" MSFS_CALLBACK void module_deinit() {

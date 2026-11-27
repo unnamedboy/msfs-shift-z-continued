@@ -10,15 +10,15 @@ KEY CONFLICTS
 The default MSFS 2024 keyboard profile binds Shift+Z to Slew mode, and your
 own profile may bind other commands to Shift+Z or Ctrl+Shift+Z.
 
-When a key of this add-on also triggers a simulator command, its settings open
-by themselves and name that command by its SimConnect name (for example
-AUTORUDDER_TOGGLE; the MSFS controls may list it under a more readable
-name). You can then remove the binding in the MSFS keyboard controls (and
-save the profile), choose a different key with "Change key", or press
-"Ignore" to keep both. After "Ignore" the add-on no longer warns about
-key conflicts at all, and the settings offer no way to turn the warnings
-back on. Some camera and menu actions are not visible to the add-on and
-cannot be detected.
+When a simulator command runs right after one of this add-on's keys, its
+settings open and warn that the key may also be bound to that command, named
+by its SimConnect name (for example AUTORUDDER_TOGGLE; the MSFS controls may
+use a more readable name). This is a guess from timing, not proof. You can
+remove the binding in the MSFS keyboard controls (and save the profile),
+choose a different key with "Change key", or press "Ignore" to keep both.
+After "Ignore" the add-on no longer checks for key conflicts, and the
+settings offer no way to turn the check back on. Some camera and menu
+actions are not visible to the add-on and cannot be detected.
 
 INSTALLATION
 ------------
