@@ -387,6 +387,7 @@ class ShiftZContinued extends UIElement {
       this.endDrag();
       this.capturing = null;
       this.message = '';
+      this.conflict = null;  // a warning is for the press that opened the card, not for later visits
       this.closedAfterPress = this.lastPress;
     }
     if (this.rootElement) this.rootElement.classList.toggle('config-mode', enabled);

@@ -776,6 +776,16 @@ test('the warning names the current key, and a change of the other key keeps it'
   assert.equal(panel.conflict.key, 'cycle');
 });
 
+test('closing the settings drops the warning', () => {
+  const { panel, events, find, button } = createPanel(sim);
+  events.get('SHIFT_Z_CONTINUED_CONFLICT')('{"key":"cycle","press":1,"commands":["SLEW_TOGGLE"]}');
+  assert.equal(find('config-warning')[0].style.display, 'block');
+  button('Done').fire('click');
+  panel.setConfigMode(true);
+  assert.equal(panel.conflict, null);
+  assert.equal(find('config-warning')[0].style.display, 'none');
+});
+
 test('a press swallowed by a key capture still counts for late reports', () => {
   const { panel, events, find, button, root } = createPanel(sim, JSON.stringify({ x: 30 }));
   panel.setConfigMode(true);
