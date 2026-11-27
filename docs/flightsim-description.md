@@ -32,7 +32,7 @@ The overlay shows flight and performance information as red text over the simula
 
 **Key conflicts**
 
-The default MSFS 2024 keyboard profile binds Shift+Z to Slew mode, and your profile may bind other commands to these keys. When one of the add-on's keys also triggers a simulator command, the settings open by themselves and name that command. Remove the binding in the MSFS keyboard controls, choose another key, or press **Ignore** to turn these warnings off for good.
+The default MSFS 2024 keyboard profile binds Shift+Z to Slew mode, and your profile may bind other commands to these keys. When a simulator command runs right after one of the add-on's keys, the settings open and warn that the key may also be bound to that command. Remove the binding in the MSFS keyboard controls, choose another key, or press **Ignore** to turn these warnings off for good.
 
 **Installation**
 

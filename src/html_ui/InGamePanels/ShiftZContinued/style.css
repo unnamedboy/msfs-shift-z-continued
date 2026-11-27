@@ -1,7 +1,8 @@
 ingame-ui#ShiftZContinued { background: transparent; border: 0; color: #ff5252; font: bold 16px sans-serif; pointer-events: none; width: 100% !important; height: 100% !important; min-width: 0 !important; min-height: 0 !important; }
 ingame-ui#ShiftZContinued ingame-ui-header { display: none !important; }
 ingame-ui#ShiftZContinued .ingameUiWrapper, ingame-ui#ShiftZContinued .ingameUiContent { position: relative !important; flex: 1 1 auto !important; width: 100% !important; height: 100% !important; min-width: 0 !important; min-height: 0 !important; background: transparent !important; pointer-events: none; }
-ingame-ui#ShiftZContinued #stats { position: absolute; left: 1%; top: 0.5%; margin-right: -10000px; padding: 2px 4px; border: 2px solid transparent; text-shadow: 1px 1px 2px black; white-space: pre; pointer-events: none; }
+/* JS moves the text with a transform from the top-left corner, so its box never shrinks at the right edge. */
+ingame-ui#ShiftZContinued #stats { position: absolute; left: 0; top: 0; padding: 2px 4px; border: 2px solid transparent; text-shadow: 1px 1px 2px black; white-space: pre; pointer-events: none; }
 ingame-ui#ShiftZContinued .degree-mark { display: inline-block; width: .32em; height: .32em; box-sizing: border-box; border: .09em solid currentColor; border-radius: 50%; vertical-align: .5em; margin-left: .03em; }
 
 /* Configuration mode: the only state in which the panel accepts the mouse. */
@@ -25,4 +26,3 @@ ingame-ui#ShiftZContinued .config-warning .config-button { display: inline-block
 ingame-ui#ShiftZContinued .config-key { align-items: center; }
 ingame-ui#ShiftZContinued .config-key .config-key-text { flex: 2 1 0; }
 ingame-ui#ShiftZContinued .config-message { color: #ffd166; font-size: 12px; margin-top: 4px; }
-ingame-ui#ShiftZContinued .config-link { color: #9aa4b2; font-size: 11px; margin-top: 6px; }

@@ -1,365 +1,436 @@
+// Desktop tests for the WASM module: the real fps.cpp compiled against a small fake of SimConnect and CommBus.
 #include <cassert>
+#include <cstdlib>
+#if defined(_MSC_VER)
+#include <crtdbg.h>
+// Declared here because <windows.h> clashes with the SDK type stubs.
+extern "C" __declspec(dllimport) unsigned int __stdcall SetErrorMode(unsigned int);
+#endif
 #include <cstring>
-#include <limits>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 #include "../src/wasm/fps.cpp"
 
 namespace {
-std::vector<std::string> events;
-std::vector<std::string> messages;
-std::vector<std::string> messageNames;
-std::vector<std::string> inputDefinitions;
-std::vector<SIMCONNECT_CLIENT_EVENT_ID> inputDownEvents;
-fsCommBusWasmCallback setKeysHandler = nullptr;
-double lvarValue = 0;
-int lvarRegistrations = 0;
-std::vector<SIMCONNECT_CLIENT_EVENT_ID> notificationEvents;
-std::vector<std::string> watchedCommands;
-std::vector<std::pair<SIMCONNECT_NOTIFICATION_GROUP_ID, SIMCONNECT_CLIENT_EVENT_ID>> watchGroups;
-std::vector<SIMCONNECT_NOTIFICATION_GROUP_ID> watchPriorities;
-DWORD lastPacket = 0;
-int hotkeyCall = 0, failHotkeyCall = 0, clearedInputs = 0;
-bool inputEnabled = false;
-int fail_open = 0, fail_subscribe = 0, closed = 0;
-DispatchProc callback = nullptr;
+// The fake gives every call a packet id; a mapping of `rejectDefinition` succeeds but queues an exception,
+// which deliver() hands to the module before the system state answers, as SimConnect does.
+struct FakeSim {
+    DWORD packet = 0;
+    bool failOpen = false, failSubscribe = false;
+    int failMapInputs = 0;  // the next n input mappings fail at once
+    std::string rejectDefinition;
+    std::string rejectName;  // a watched command name the sim does not know
+    std::vector<std::string> inputs;                 // input definitions currently mapped
+    std::map<std::string, SIMCONNECT_CLIENT_EVENT_ID> watched;  // command name -> client event
+    std::set<SIMCONNECT_NOTIFICATION_GROUP_ID> watchGroups;     // groups holding watched events
+    // Answers still to deliver, in packet order: an exception (state == 0) or a system state answer.
+    struct Answer { SIMCONNECT_RECV_EXCEPTION error; DWORD state; };
+    std::vector<Answer> answers;
+    std::vector<std::pair<std::string, std::string>> messages;  // CommBus name, payload
+    fsCommBusWasmCallback setKeys = nullptr;
+    DispatchProc dispatch = nullptr;
+    int closed = 0;
+} sim;
+
+DWORD send() { return ++sim.packet; }
 }
+
 int SimConnect_Open(HANDLE* handle, const char*, void*, DWORD, int, DWORD) {
-    if (fail_open) return 1;
+    if (sim.failOpen) return 1;
     *handle = 7; return S_OK;
 }
-int SimConnect_SubscribeToSystemEvent(HANDLE, SIMCONNECT_CLIENT_EVENT_ID, const char* name) {
-    events.emplace_back(name); return fail_subscribe ? 1 : S_OK;
-}
-int SimConnect_CallDispatch(HANDLE, DispatchProc proc, void*) { callback = proc; return S_OK; }
-int SimConnect_Close(HANDLE) { ++closed; return S_OK; }
-int hotkeyResult() { return ++hotkeyCall == failHotkeyCall ? 1 : S_OK; }
+int SimConnect_SubscribeToSystemEvent(HANDLE, SIMCONNECT_CLIENT_EVENT_ID, const char*) { send(); return sim.failSubscribe ? 1 : S_OK; }
+int SimConnect_CallDispatch(HANDLE, DispatchProc proc, void*) { sim.dispatch = proc; return S_OK; }
+int SimConnect_Close(HANDLE) { ++sim.closed; return S_OK; }
 int SimConnect_MapClientEventToSimEvent(HANDLE, SIMCONNECT_CLIENT_EVENT_ID event, const char* name) {
-    if (name && *name) {  // command watch, not a hotkey
-        assert(event == kWatchFirstEvent + watchedCommands.size() % shiftz::kWatchedCommandCount);
-        watchedCommands.emplace_back(name); lastPacket += 2; return S_OK;
+    const DWORD id = send();
+    if (name && *name) sim.watched[name] = event;
+    if (name && sim.rejectName == name) {
+        SIMCONNECT_RECV_EXCEPTION error{}; error.dwID = SIMCONNECT_RECV_ID_EXCEPTION; error.dwException = 7; error.dwSendID = id;
+        sim.answers.push_back({error, 0});
     }
-    return hotkeyResult();
+    return S_OK;
 }
-int SimConnect_AddClientEventToNotificationGroup(HANDLE, SIMCONNECT_NOTIFICATION_GROUP_ID group, SIMCONNECT_CLIENT_EVENT_ID event, int maskable) {
-    assert(!maskable);
-    if (group >= kWatchFirstGroup) { watchGroups.emplace_back(group, event); return S_OK; }
-    notificationEvents.push_back(event); return hotkeyResult();
+int SimConnect_AddClientEventToNotificationGroup(HANDLE, SIMCONNECT_NOTIFICATION_GROUP_ID group, SIMCONNECT_CLIENT_EVENT_ID, int maskable) {
+    send(); assert(!maskable);  // the module must never hide a key from the sim
+    if (group >= kWatchFirstGroup) sim.watchGroups.insert(group);
+    return S_OK;
 }
-int SimConnect_SetNotificationGroupPriority(HANDLE, SIMCONNECT_NOTIFICATION_GROUP_ID group, DWORD priority) {
-    if (group >= kWatchFirstGroup) {  // watch groups come first so no maskable group can hide a command
-        assert(priority == SIMCONNECT_GROUP_PRIORITY_HIGHEST); watchPriorities.push_back(group); return S_OK;
+int SimConnect_SetNotificationGroupPriority(HANDLE, SIMCONNECT_NOTIFICATION_GROUP_ID, DWORD) { send(); return S_OK; }
+int SimConnect_ClearNotificationGroup(HANDLE, SIMCONNECT_NOTIFICATION_GROUP_ID group) { send(); sim.watchGroups.erase(group); return S_OK; }
+int SimConnect_MapInputEventToClientEvent_EX1(HANDLE, SIMCONNECT_INPUT_GROUP_ID, const char* definition, SIMCONNECT_CLIENT_EVENT_ID, DWORD, SIMCONNECT_CLIENT_EVENT_ID, DWORD, int maskable) {
+    const DWORD id = send(); assert(!maskable);
+    if (sim.failMapInputs > 0) { --sim.failMapInputs; return 1; }
+    if (definition == sim.rejectDefinition) {
+        SIMCONNECT_RECV_EXCEPTION error{}; error.dwID = SIMCONNECT_RECV_ID_EXCEPTION; error.dwException = 7; error.dwSendID = id;
+        sim.answers.push_back({error, 0});
     }
-    assert(priority == SIMCONNECT_GROUP_PRIORITY_STANDARD);
-    return hotkeyResult();
+    sim.inputs.emplace_back(definition);
+    return S_OK;
 }
-int SimConnect_GetLastSentPacketID(HANDLE, DWORD* id) { *id = lastPacket; return S_OK; }
-int SimConnect_MapInputEventToClientEvent_EX1(HANDLE, SIMCONNECT_INPUT_GROUP_ID, const char* definition, SIMCONNECT_CLIENT_EVENT_ID down, DWORD, SIMCONNECT_CLIENT_EVENT_ID up, DWORD, int maskable) {
-    assert((down == kCycleDownEvent && up == kCycleUpEvent) || (down == kConfigDownEvent && up == kConfigUpEvent));
-    assert(!maskable);
-    inputDefinitions.emplace_back(definition); inputDownEvents.push_back(down); return hotkeyResult();
-}
-int SimConnect_SetInputGroupPriority(HANDLE, SIMCONNECT_INPUT_GROUP_ID, DWORD priority) {
-    assert(priority == SIMCONNECT_GROUP_PRIORITY_STANDARD); return hotkeyResult();
-}
-int SimConnect_SetInputGroupState(HANDLE, SIMCONNECT_INPUT_GROUP_ID, DWORD state) {
-    assert(state == SIMCONNECT_STATE_ON);
-    const int result = hotkeyResult(); inputEnabled = result == S_OK; return result;
-}
-int SimConnect_ClearInputGroup(HANDLE, SIMCONNECT_INPUT_GROUP_ID) {
-    ++clearedInputs; inputEnabled = false; return S_OK;
+int SimConnect_SetInputGroupPriority(HANDLE, SIMCONNECT_INPUT_GROUP_ID, DWORD) { send(); return S_OK; }
+int SimConnect_SetInputGroupState(HANDLE, SIMCONNECT_INPUT_GROUP_ID, DWORD) { send(); return S_OK; }
+int SimConnect_ClearInputGroup(HANDLE, SIMCONNECT_INPUT_GROUP_ID) { send(); sim.inputs.clear(); return S_OK; }
+int SimConnect_GetLastSentPacketID(HANDLE, DWORD* id) { *id = sim.packet; return S_OK; }
+int SimConnect_RequestSystemState(HANDLE, SIMCONNECT_DATA_REQUEST_ID request, const char* state) {
+    send(); assert(std::string(state) == "Sim" && request != 0); sim.answers.push_back({{}, request}); return S_OK;
 }
 bool fsCommBusCall(const char* name, const char* data, unsigned int length, FsCommBusBroadcastFlags destination) {
     assert(destination == FsCommBusBroadcast_JS);
-    messageNames.emplace_back(name);
-    messages.emplace_back(data, length); return true;
+    sim.messages.emplace_back(name, std::string(data, length)); return true;
 }
 bool fsCommBusRegister(const char* name, fsCommBusWasmCallback handler, void*) {
-    assert(std::string(name) == "SHIFT_Z_CONTINUED_SET_KEYS"); setKeysHandler = handler; return true;
+    assert(std::string(name) == "SHIFT_Z_CONTINUED_SET_KEYS"); sim.setKeys = handler; return true;
 }
-FsUnitId fsVarsGetUnitId(const char* unit) { assert(std::string(unit) == "number"); return 11; }
-FsLVarId fsVarsRegisterLVar(const char* name) {
-    assert(std::string(name) == "SHIFT_Z_CONTINUED_KEYS"); ++lvarRegistrations; return 42;
-}
-FsVarError fsVarsLVarGet(FsLVarId id, FsUnitId unit, double* value) {
-    assert(id == 42 && unit == 11); *value = lvarValue; return FS_VAR_ERROR_NONE;
-}
-int fsCommBusUnregister(const char*, fsCommBusWasmCallback handler) { if (setKeysHandler == handler) setKeysHandler = nullptr; return 1; }
+int fsCommBusUnregister(const char*, fsCommBusWasmCallback handler) { if (sim.setKeys == handler) sim.setKeys = nullptr; return 1; }
 
-void testHotkeyParsing() {
+namespace {
+void deliver() {
+    const auto answers = sim.answers;
+    sim.answers.clear();
+    for (auto answer : answers) {
+        if (answer.state == 0) {
+            sim.dispatch(&answer.error, sizeof(answer.error), nullptr);
+            continue;
+        }
+        SIMCONNECT_RECV_SYSTEM_STATE state{}; state.dwID = SIMCONNECT_RECV_ID_SYSTEM_STATE; state.dwRequestID = answer.state;
+        sim.dispatch(&state, sizeof(state), nullptr);
+    }
+}
+void event(SIMCONNECT_CLIENT_EVENT_ID id) {
+    SIMCONNECT_RECV_EVENT message{}; message.dwID = SIMCONNECT_RECV_ID_EVENT; message.uEventID = id;
+    sim.dispatch(&message, sizeof(message), nullptr);
+}
+void frames(int count, float frameRate = 30, SIMCONNECT_CLIENT_EVENT_ID id = kFrameEvent) {
+    SIMCONNECT_RECV_EVENT_FRAME frame{}; frame.dwID = SIMCONNECT_RECV_ID_EVENT_FRAME; frame.uEventID = id; frame.fFrameRate = frameRate;
+    for (int i = 0; i < count; ++i) sim.dispatch(&frame, sizeof(frame), nullptr);
+}
+void request(const std::string& text) { sim.setKeys(text.c_str(), static_cast<unsigned>(text.size()), nullptr); }
+std::string last(const char* name) {
+    for (auto it = sim.messages.rbegin(); it != sim.messages.rend(); ++it) if (it->first == name) return it->second;
+    return "";
+}
+size_t count(const char* name) {
+    size_t n = 0;
+    for (const auto& message : sim.messages) n += message.first == name;
+    return n;
+}
+bool mapped(const char* definition) {
+    for (const auto& input : sim.inputs) if (input == definition) return true;
+    return false;
+}
+const std::string kAltXF9 = "cycle=VK_LMENU+X|VK_RMENU+X;config=VK_F9";
+const std::string kCtrlP = "cycle=VK_LCONTROL+P|VK_RCONTROL+P;config=VK_F9";
+}
+
+void testParsing() {
     shiftz::HotkeySet keys;
     const char good[] = "cycle=VK_LMENU+X|VK_LMENU+x;config=VK_F9";
     assert(shiftz::parseHotkeySet(good, sizeof(good), keys));  // a sent terminator is tolerated
-    assert(keys.counts[0] == 2 && keys.counts[1] == 1);
-    assert(std::string(keys.definitions[0][1]) == "VK_LMENU+x" && std::string(keys.definitions[1][0]) == "VK_F9");
-    for (const char* bad : {"", "cycle=VK_F1", "config=VK_F1", "cycle=VK_F1;config=", "cycle=VK_F1;config=A|",
-                            "cycle=VK F1;config=VK_F2", "cycle=VK_F1;cycle=VK_F2", "other=VK_F1;config=VK_F2",
-                            "cycle=VK_F1;config=VK_F2;extra=1"}) {
-        assert(!shiftz::parseHotkeySet(bad, std::string(bad).size(), keys));
+    assert(keys.counts[0] == 2 && keys.counts[1] == 1 && std::string(keys.definitions[1][0]) == "VK_F9");
+    for (const char* bad : {"", "cycle=VK_F1", "cycle=VK_F1;config=", "cycle=VK_F1;config=A|", "cycle=VK F1;config=VK_F2",
+                            "cycle=VK_F1;cycle=VK_F2", "cycle=VK_F1;config=VK_F2;extra=1"}) {
+        assert(!shiftz::parseHotkeySet(bad, std::strlen(bad), keys));
     }
-    std::string many = "cycle=";
-    for (int i = 0; i < 17; ++i) many += i ? "|VK_F1" : "VK_F1";
-    many += ";config=VK_F2";
-    assert(!shiftz::parseHotkeySet(many.c_str(), many.size(), keys));
-    std::string longDef = "cycle=" + std::string(41, 'A') + ";config=VK_F2";
-    assert(!shiftz::parseHotkeySet(longDef.c_str(), longDef.size(), keys));
+
+    shiftz::KeyRequest request;
+    const std::string valid = "id=12;watch=1;" + kAltXF9;
+    assert(shiftz::parseKeyRequest(valid.c_str(), valid.size(), request) && request.id == 12 && request.watch);
+    const std::string off = "id=3;watch=0;" + kAltXF9;
+    assert(shiftz::parseKeyRequest(off.c_str(), off.size(), request) && !request.watch);
+    const std::string badKeys = "id=5;watch=1;cycle=VK_F1";
+    assert(!shiftz::parseKeyRequest(badKeys.c_str(), badKeys.size(), request) && request.id == 5);  // still answerable
+    const std::string nine = "id=1;watch=1;cycle=A|B|C|D|E|F|G|H|I;config=VK_F9";
+    assert(!shiftz::parseKeyRequest(nine.c_str(), nine.size(), request));  // more definitions than a combination has
+    for (const std::string bad : {"watch=1;" + kAltXF9, "id=;watch=1;" + kAltXF9, "id=1;watch=2;" + kAltXF9,
+                                  "id=1234567890;watch=1;" + kAltXF9}) {
+        assert(!shiftz::parseKeyRequest(bad.c_str(), bad.size(), request));
+    }
 }
 
-void testHotkeyCodes() {
-    char text[512];
-    auto decode = [&](double value) { return std::string(text, shiftz::hotkeyTextFromCode(value, text, sizeof(text))); };
-    constexpr double z = 25, shift = 4 * 64, ctrlShift = 5 * 64;
-    assert(decode(shift + z + (ctrlShift + z) * 512) == kDefaultKeys);
-    assert(decode(shift + z + (ctrlShift + z) * 512 + 7 * 262144) == kDefaultKeys);
-    assert(decode(1 * 64 + 26 + 41 * 512) == "cycle=VK_LCONTROL+0|VK_RCONTROL+0;config=VK_F6");
-    assert(decode(3 * 64 + 15 + 47 * 512) ==
-           "cycle=VK_LCONTROL+VK_LMENU+P|VK_LCONTROL+VK_LMENU+p|VK_LCONTROL+VK_RMENU+P|VK_LCONTROL+VK_RMENU+p|"
-           "VK_RCONTROL+VK_LMENU+P|VK_RCONTROL+VK_LMENU+p|VK_RCONTROL+VK_RMENU+P|VK_RCONTROL+VK_RMENU+p;config=VK_F12");
-    for (double bad : {0.0, -1.0, 1.5, std::numeric_limits<double>::quiet_NaN(),
-                       z + 44 * 512.0,                // letter without a modifier
-                       26 + 44 * 512.0,               // digit without a modifier
-                       7 * 64 + z + 44 * 512.0,       // three modifiers
-                       48 + 44 * 512.0,               // no such key
-                       44 + 44 * 512.0}) {            // both keys the same
-        assert(shiftz::hotkeyTextFromCode(bad, text, sizeof(text)) == 0);
+void testDetector() {
+    using Detector = shiftz::KeyConflictDetector;
+    // Same scenario at two frame rates: background command 7 all the time, command 9 just after the press.
+    for (const double step : {1.0 / 20, 1.0 / 120}) {
+        Detector detector;
+        auto run = [&](double seconds, bool background) {
+            for (double t = 0; t < seconds; t += step) { if (background) detector.onCommand(7); detector.advance(step); }
+        };
+        run(3, true);
+        detector.onPress(0, 1);
+        detector.onCommand(7);
+        run(0.05, false);
+        detector.onCommand(9);
+        assert(!detector.poll().ready);
+        run(0.4, true);
+        auto report = detector.poll();
+        assert(report.ready && report.key == 0 && report.press == 1 && report.count == 1 && report.commands[0] == 9);
+        assert(!detector.poll().ready);
     }
-    assert(shiftz::hotkeyTextFromCode(shift + z + (ctrlShift + z) * 512, text, 40) == 0);  // buffer too small
-}
 
-SIMCONNECT_CLIENT_EVENT_ID watchEvent(const char* name) {
-    for (size_t i = 0; i < shiftz::kWatchedCommandCount; ++i) {
-        if (std::string(shiftz::kWatchedCommands[i]) == name) return static_cast<SIMCONNECT_CLIENT_EVENT_ID>(kWatchFirstEvent + i);
+    // The sim may run the binding just before our input event; repeated presses keep being reported
+    // although the same command then appears in the seconds before each press.
+    Detector detector;
+    for (unsigned press = 1; press <= 3; ++press) {
+        detector.onCommand(4);
+        detector.advance(0.05);
+        detector.onPress(1, press);
+        detector.advance(0.5);
+        const auto report = detector.poll();
+        assert(report.ready && report.key == 1 && report.press == press && report.count == 1 && report.commands[0] == 4);
+        detector.advance(0.5);
     }
-    return 0;
-}
 
-void testConflictDetector() {
-    shiftz::KeyConflictDetector detector;
-    auto frames = [&](int count) { for (int i = 0; i < count; ++i) detector.onFrame(); };
-    // Continuous event 100 every frame, then a press that also fires event 200 one frame later.
-    for (int i = 0; i < 80; ++i) { detector.onKeyEvent(100); detector.onFrame(); }
-    detector.onPress(0);
-    detector.onKeyEvent(100);
-    frames(1);
-    detector.onKeyEvent(200);
-    detector.onKeyEvent(200);
-    for (int i = 0; i < 8; ++i) { detector.onKeyEvent(100); assert(!detector.poll().ready); detector.onFrame(); }
-    frames(1);
-    auto report = detector.poll();
-    assert(report.ready && report.key == 0 && report.count == 1 && report.events[0] == 200);
-    char text[160];
-    assert(std::string(text, shiftz::KeyConflictDetector::format(report, text, sizeof(text))) == "{\"key\":\"cycle\",\"events\":[\"event 200\"]}");
-    const char* const names[] = {"A", "B"};
-    report.events[1] = 1; report.count = 2;
-    assert(std::string(text, shiftz::KeyConflictDetector::format(report, text, sizeof(text), names, 2)) == "{\"key\":\"cycle\",\"events\":[\"event 200\",\"B\"]}");
-    report.count = 1;
+    // A command in the window of a later press of the other key belongs to that press only.
+    detector.advance(3);
+    detector.onPress(1, 4);
+    detector.advance(0.2);
+    detector.onPress(0, 5);
+    detector.onCommand(6);
+    detector.advance(0.5);
+    auto first = detector.poll();
+    auto second = detector.poll();
+    assert(first.ready && first.key == 1 && first.count == 0);  // the earlier press is evaluated first
+    assert(second.ready && second.key == 0 && second.count == 1 && second.commands[0] == 6);
+
+    // A command that fired without a press (while the key was being captured) hides the first press after
+    // it, but not the following ones.
+    {
+        Detector chain;
+        chain.advance(5);
+        chain.onCommand(4);
+        chain.advance(1);
+        for (unsigned press = 1; press <= 3; ++press) {
+            chain.onPress(0, press);
+            chain.onCommand(4);
+            chain.advance(0.5);
+            const auto result = chain.poll();
+            assert(result.ready && result.count == (press == 1 ? 0u : 1u));
+            chain.advance(1);
+        }
+    }
+
+    // Quick presses do not turn a command that fires at least twice a second into a conflict.
+    for (const double period : {1.0 / 30, 0.25, 0.5}) {
+        Detector busy;
+        double nextCommand = 0, nextPress = 3, time = 0;
+        unsigned press = 0;
+        while (time < 8) {
+            if (time >= nextCommand) { busy.onCommand(7); nextCommand += period; }
+            if (time >= nextPress) { ++press; busy.onPress(press % 2, press); nextPress += 0.4; }
+            busy.advance(1.0 / 60);
+            time += 1.0 / 60;
+            const auto result = busy.poll();
+            assert(!result.ready || result.count == 0);
+        }
+        assert(press > 10);
+    }
+
+    // Three presses in the 2 s before a press: not judged. One of them just over 2 s back: judged.
+    for (const double gap : {0.6, 0.7}) {
+        Detector burst;
+        burst.advance(5);
+        for (unsigned press = 1; press <= 3; ++press) {
+            burst.onPress(0, press);
+            burst.advance(gap);
+            burst.poll();
+        }
+        burst.onPress(0, 4);
+        burst.onCommand(8);
+        burst.advance(0.5);
+        const auto result = burst.poll();
+        assert(result.ready && result.count == (gap < 0.65 ? 0u : 1u));
+    }
+
+    // Without a full baseline since the watch started, a press is not judged.
+    {
+        Detector fresh;
+        fresh.advance(10);
+        fresh.onWatchStart();
+        for (const double wait : {1.0, 2.5}) {
+            fresh.advance(wait);
+            fresh.onPress(0, 1);
+            fresh.onCommand(3);
+            fresh.advance(0.5);
+            const auto result = fresh.poll();
+            assert(result.ready && result.count == (wait < 2 ? 0u : 1u));
+        }
+    }
+
+    // A press whose window has not closed yet is dropped by clearPending.
+    detector.onPress(0, 9);
+    detector.onCommand(5);
+    detector.clearPending();
+    detector.advance(1);
     assert(!detector.poll().ready);
 
-    // A binding the sim runs just before our input event arrives is still caught; quiet presses report nothing.
-    frames(100);
-    detector.onKeyEvent(300);
-    frames(1);
-    detector.onPress(1);
-    frames(10);
-    report = detector.poll();
-    assert(report.ready && report.key == 1 && report.count == 1 && report.events[0] == 300);
-    frames(100);
-    detector.onPress(0);
-    frames(10);
-    report = detector.poll();
-    assert(report.ready && report.count == 0);
-    assert(shiftz::KeyConflictDetector::format(report, text, sizeof(text)) > 0);
+    Detector::Report report;
+    report.ready = true; report.key = 1; report.press = 4; report.count = 3;
+    report.commands[0] = 1; report.commands[1] = 99; report.commands[2] = 0;
+    const char* const names[] = {"A_1", "B"};
+    char text[64];
+    assert(std::string(text, Detector::format(report, names, 2, text, sizeof(text))) ==
+           "{\"key\":\"config\",\"press\":4,\"commands\":[\"B\",\"A_1\"]}");
+    assert(Detector::format(report, names, 2, text, 20) == 0);
 }
 
-void testKeyEventsAndRemap() {
-    assert(setKeysHandler);
-    SIMCONNECT_RECV_EVENT_FRAME frame{};
-    frame.dwID = SIMCONNECT_RECV_ID_EVENT_FRAME; frame.uEventID = 1; frame.fFrameRate = 0;  // no FPS broadcast
-    SIMCONNECT_RECV_EVENT key{};
-    key.dwID = SIMCONNECT_RECV_ID_EVENT;
-    for (int i = 0; i < 70; ++i) callback(&frame, sizeof(frame), nullptr);
-    key.uEventID = kCycleUpEvent; callback(&key, sizeof(key), nullptr);
-    key.uEventID = kCycleDownEvent; callback(&key, sizeof(key), nullptr);
-    SIMCONNECT_RECV_EVENT watch{};  // SimConnect reports SLEW_TOGGLE, bound to the same key
-    watch.dwID = SIMCONNECT_RECV_ID_EVENT; watch.uEventID = watchEvent("SLEW_TOGGLE");
-    callback(&watch, sizeof(watch), nullptr);
-    const auto before = messages.size();
-    for (int i = 0; i < 10; ++i) callback(&frame, sizeof(frame), nullptr);
-    assert(messages.size() == before + 1 && messageNames.back() == "SHIFT_Z_CONTINUED_CONFLICT");
-    assert(messages.back() == "{\"key\":\"cycle\",\"events\":[\"SLEW_TOGGLE\"]}");
-    key.uEventID = kCycleUpEvent; callback(&key, sizeof(key), nullptr);
+void testModule() {
+    module_init();
+    assert(sim.setKeys && sim.dispatch);
+    assert(mapped("VK_LSHIFT+Z") && mapped("VK_RCONTROL+VK_RSHIFT+z"));  // defaults until the panel sends keys
+    assert(sim.watched.empty() && sim.watchGroups.empty());            // no watch before the panel asks for it
 
-    // A valid key set from the panel replaces all mappings.
-    inputDefinitions.clear(); inputDownEvents.clear();
-    const int clearedBefore = clearedInputs;
-    const char keys[] = "cycle=VK_LMENU+X|VK_RMENU+X;config=VK_F9";
-    setKeysHandler(keys, sizeof(keys) - 1, nullptr);
-    assert(clearedInputs == clearedBefore + 1 && inputEnabled);
-    assert(messageNames.back() == "SHIFT_Z_CONTINUED_KEYS_STATUS" && messages.back() == "{\"via\":\"commbus\",\"result\":\"applied\"}");
-    assert((inputDefinitions == std::vector<std::string>{"VK_LMENU+X", "VK_RMENU+X", "VK_F9"}));
-    assert((inputDownEvents == std::vector<SIMCONNECT_CLIENT_EVENT_ID>{kCycleDownEvent, kCycleDownEvent, kConfigDownEvent}));
-    // Invalid text changes nothing.
-    inputDefinitions.clear();
-    const char bad[] = "cycle=VK_F1;config=bad key";
-    setKeysHandler(bad, sizeof(bad) - 1, nullptr);
-    assert(inputDefinitions.empty() && clearedInputs == clearedBefore + 1);
-    assert(messages.back() == "{\"via\":\"commbus\",\"result\":\"invalid\"}");
-    // A key set the sim rejects falls back to the defaults.
-    hotkeyCall = 0; failHotkeyCall = 1;
-    setKeysHandler(keys, sizeof(keys) - 1, nullptr);
-    failHotkeyCall = 0;
-    assert(inputEnabled && inputDefinitions.size() == 1 + 12 && inputDefinitions.back() == "VK_RCONTROL+VK_RSHIFT+z");
-    assert(messages.back() == "{\"via\":\"commbus\",\"result\":\"failed-defaults\"}");
+    // Presses are numbered; key repeat is absorbed until the key is released.
+    event(kCycleDownEvent); event(kCycleDownEvent); event(kCycleUpEvent); event(kConfigDownEvent);
+    assert(count(kCycleMessageName) == 1 && last(kCycleMessageName) == "{\"press\":1}");
+    assert(last(kConfigMessageName) == "{\"press\":2}");
+    event(kConfigUpEvent);
 
-    // The same key set can arrive through the L:var, encoded as a number; each new value is applied once.
-    assert(lvarRegistrations == 1);
-    constexpr double altX = 2 * 64 + 23, f9 = 36 + 8;
-    auto frames = [&](int count) { for (int i = 0; i < count; ++i) callback(&frame, sizeof(frame), nullptr); };
-    inputDefinitions.clear();
-    lvarValue = altX + f9 * 512 + 262144;
-    frames(1);
-    assert((inputDefinitions == std::vector<std::string>{"VK_LMENU+X", "VK_LMENU+x", "VK_RMENU+X", "VK_RMENU+x", "VK_F9"}));
-    assert(messages.back() == "{\"via\":\"lvar\",\"result\":\"applied\"}");
-    const auto countBefore = messages.size();
-    frames(3);
-    assert(messages.size() == countBefore && inputDefinitions.size() == 5);
-    lvarValue = altX + altX * 512 + 2 * 262144;  // both keys the same
-    frames(1);
-    assert(inputDefinitions.size() == 5 && messages.back() == "{\"via\":\"lvar\",\"result\":\"invalid\"}");
-    const auto countZero = messages.size();
-    for (double notFromPanel : {0.0, 1.0, altX + f9 * 512}) {  // no send counter: never written by the panel
-        lvarValue = notFromPanel;
-        frames(1);
-    }
-    assert(messages.size() == countZero && inputDefinitions.size() == 5);
-    lvarValue = altX + f9 * 512 + 3 * 262144;  // the same keys sent again
-    frames(1);
-    assert(inputDefinitions.size() == 10 && messages.back() == "{\"via\":\"lvar\",\"result\":\"applied\"}");
-    lvarValue = 0;
+    // A key change is answered only after SimConnect has processed it. An unknown watched name, rejected in
+    // the same request before the key mappings, does not count against the key change.
+    sim.rejectName = "SLEW_TOGGLE";
+    request("id=1;watch=1;" + kAltXF9);
+    sim.rejectName.clear();
+    assert(mapped("VK_LMENU+X") && !mapped("VK_LSHIFT+Z") && last(kKeysStatusMessageName).empty());
+    deliver();
+    assert(last(kKeysStatusMessageName) == "{\"id\":1,\"result\":\"applied\"}");
+    assert(sim.watched.size() == shiftz::kWatchedCommandCount && sim.watched.count("AUTORUDDER_TOGGLE"));
+    assert(sim.watchGroups.size() == kWatchGroupCount);
+
+    // Only the newest of two quick requests is answered, and an exception for the older one does not fail it.
+    sim.rejectDefinition = "VK_F2";
+    request("id=2;watch=1;cycle=VK_F2;config=VK_F9");
+    sim.rejectDefinition.clear();
+    request("id=3;watch=1;" + kAltXF9);
+    deliver();
+    assert(last(kKeysStatusMessageName) == "{\"id\":3,\"result\":\"applied\"}");
+    assert(count(kKeysStatusMessageName) == 2 && mapped("VK_LMENU+X") && !mapped("VK_F2"));
+
+    // The state answer of a replaced request does not confirm the newer one: that one's own exception,
+    // which arrives later, still fails it.
+    request("id=20;watch=1;cycle=VK_F3;config=VK_F9");
+    sim.rejectDefinition = "VK_F4";
+    request("id=21;watch=1;cycle=VK_F4;config=VK_F9");
+    sim.rejectDefinition.clear();
+    deliver();
+    assert(last(kKeysStatusMessageName) == "{\"id\":21,\"result\":\"failed\"}");
+    assert(mapped("VK_LMENU+X") && !mapped("VK_F3") && !mapped("VK_F4"));
+
+    // Keys the sim rejects later (an exception, not a failed call) give way to the previous keys, not the defaults.
+    // A press made while the rejected keys were mapped is not reported against the restored keys.
+    const size_t reportsBefore = count(kConflictMessageName);
+    sim.rejectDefinition = "VK_LCONTROL+P";
+    request("id=4;watch=1;" + kCtrlP);
+    frames(90);
+    event(kCycleDownEvent); event(sim.watched.at("PAUSE_TOGGLE")); event(kCycleUpEvent);
+    deliver();
+    frames(15);
+    assert(count(kConflictMessageName) == reportsBefore);
+    sim.rejectDefinition.clear();
+    assert(last(kKeysStatusMessageName) == "{\"id\":4,\"result\":\"failed\"}");
+    assert(mapped("VK_LMENU+X") && mapped("VK_F9") && !mapped("VK_LCONTROL+P") && !mapped("VK_LSHIFT+Z"));
+
+    // A call that fails at once also restores the previous keys.
+    sim.failMapInputs = 1;
+    request("id=5;watch=1;" + kCtrlP);
+    assert(last(kKeysStatusMessageName) == "{\"id\":5,\"result\":\"failed\"}");
+    assert(mapped("VK_LMENU+X") && !mapped("VK_LCONTROL+P"));
+
+    request("id=7;watch=1;cycle=bad key;config=VK_F9");
+    assert(last(kKeysStatusMessageName) == "{\"id\":7,\"result\":\"invalid\"}" && mapped("VK_LMENU+X"));
+
+    // A watched command that fires with a press is reported with the press number and its SimConnect name.
+    const auto slew = sim.watched.at("SLEW_TOGGLE");
+    frames(90);
+    event(kCycleDownEvent); event(slew); event(kCycleUpEvent);
+    const auto press = last(kCycleMessageName);
+    frames(15);
+    assert(last(kConflictMessageName) == "{\"key\":\"cycle\",\"press\":4,\"commands\":[\"SLEW_TOGGLE\"]}");
+    assert(press == "{\"press\":4}");
+
+    // A press made with the old keys is not reported after the keys change.
+    const size_t reports = count(kConflictMessageName);
+    frames(90);
+    event(kCycleDownEvent); event(slew); event(kCycleUpEvent);
+    request("id=8;watch=1;" + kCtrlP);
+    deliver();
+    frames(15);
+    assert(count(kConflictMessageName) == reports);
+
+    // Ignore turns the watch off in the sim, not just in the panel.
+    request("id=9;watch=0;" + kCtrlP);
+    deliver();
+    assert(sim.watchGroups.empty() && last(kKeysStatusMessageName) == "{\"id\":9,\"result\":\"applied\"}");
+    frames(90);
+    event(kCycleDownEvent); event(slew); event(kCycleUpEvent);
+    frames(15);
+    assert(count(kConflictMessageName) == reports);
+
+    // The watch can be turned on again: the events go back into their groups and conflicts are reported.
+    request("id=10;watch=1;" + kCtrlP);
+    deliver();
+    assert(sim.watchGroups.size() == kWatchGroupCount && sim.watched.size() == shiftz::kWatchedCommandCount);
+    // Right after the watch starts there is no baseline yet, so a press is not judged.
+    frames(15);
+    event(kCycleDownEvent); event(slew); event(kCycleUpEvent);
+    frames(15);
+    assert(count(kConflictMessageName) == reports);
+    frames(90);
+    event(kCycleDownEvent); event(slew); event(kCycleUpEvent);
+    frames(15);
+    assert(count(kConflictMessageName) == reports + 1);
+
+
+    // FPS goes to JS about four times a second; a PauseFrame after a Frame does not count the frame twice.
+    const size_t fps = count(kFpsMessageName);
+    for (int i = 0; i < 4; ++i) { frames(1, 4); frames(1, 4, kPauseFrameEvent); }
+    assert(count(kFpsMessageName) == fps + 4 && last(kFpsMessageName) == "{\"fps\":4.00}");
+    frames(3, 4, kPauseFrameEvent);  // paused, Frame no longer arriving
+    assert(count(kFpsMessageName) == fps + 7);
+    frames(1, 0);  // unusable frame rates are skipped
+    assert(count(kFpsMessageName) == fps + 7);
+
+    module_deinit();
+    assert(sim.closed == 1 && !sim.setKeys);
+}
+
+void testStartupFailures() {
+    sim = FakeSim{};
+    sim.failOpen = true;
+    module_init(); module_deinit();
+    assert(sim.closed == 0);
+
+    sim = FakeSim{};
+    sim.failSubscribe = true;
+    module_init();
+    assert(sim.closed == 1);
+    module_deinit();
+
+    // Without hotkeys the FPS line still works.
+    sim = FakeSim{};
+    sim.failMapInputs = 1;
+    module_init();
+    assert(sim.inputs.empty());
+    frames(1, 4);
+    assert(last(kFpsMessageName) == "{\"fps\":4.00}");
+    module_deinit();
 }
 
 int main() {
-    testHotkeyParsing();
-    testConflictDetector();
-    testHotkeyCodes();
-    module_init();
-    assert((events == std::vector<std::string>{"Frame", "PauseFrame"}) && callback);
-    // Every command of watched_commands.h, in order, in non-maskable groups of at most 1000 events.
-    assert(watchedCommands.size() == shiftz::kWatchedCommandCount);
-    for (size_t i = 0; i < watchedCommands.size(); ++i) assert(watchedCommands[i] == shiftz::kWatchedCommands[i]);
-    assert(watchGroups.size() == shiftz::kWatchedCommandCount);
-    for (size_t i = 0; i < watchGroups.size(); ++i) {
-        assert(watchGroups[i].first == kWatchFirstGroup + i / 1000 && watchGroups[i].second == kWatchFirstEvent + i);
-    }
-    assert(watchPriorities.size() == kWatchGroupCount && kWatchGroupCount >= 2 && kWatchFirstGroup + kWatchGroupCount <= 20);
-    // SimConnect names, not KEY_ names: the auto-rudder key runs "AUTORUDDER_TOGGLE".
-    assert(watchEvent("AUTORUDDER_TOGGLE") && watchEvent("SLEW_TOGGLE"));
-    {
-        // Watched commands alone send nothing.
-        SIMCONNECT_RECV_EVENT flight{};
-        flight.dwID = SIMCONNECT_RECV_ID_EVENT;
-        const auto messagesBefore = messages.size();
-        flight.uEventID = watchEvent("AUTORUDDER_TOGGLE"); callback(&flight, sizeof(flight), nullptr);
-        flight.uEventID = watchEvent("SLEW_TOGGLE"); callback(&flight, sizeof(flight), nullptr);
-        // Ids just outside the watch table are ignored.
-        flight.uEventID = kWatchFirstEvent + shiftz::kWatchedCommandCount; callback(&flight, sizeof(flight), nullptr);
-        flight.uEventID = kWatchFirstEvent - 1; callback(&flight, sizeof(flight), nullptr);
-        assert(messages.size() == messagesBefore && !cycleKeyDown && !configKeyDown);
-        // The same events in the EX1 form are handled alike; a press arriving as EX1 still cycles.
-        SIMCONNECT_RECV_EVENT_EX1 extended{};
-        extended.dwID = SIMCONNECT_RECV_ID_EVENT_EX1;
-        extended.uEventID = watchEvent("SLEW_TOGGLE"); callback(&extended, sizeof(extended), nullptr);
-        assert(messages.size() == messagesBefore);
-        extended.uEventID = kCycleDownEvent; callback(&extended, sizeof(extended), nullptr);
-        assert(messages.size() == messagesBefore + 1 && messageNames.back() == "SHIFT_Z_CONTINUED_CYCLE" && cycleKeyDown);
-        extended.uEventID = kCycleUpEvent; callback(&extended, sizeof(extended), nullptr);
-        assert(!cycleKeyDown);
-        // A short EX1 message is ignored.
-        extended.uEventID = kCycleDownEvent; callback(&extended, sizeof(SIMCONNECT_RECV_EVENT), nullptr);
-        assert(!cycleKeyDown && messages.size() == messagesBefore + 1);
-        // Unknown message types are ignored.
-        SIMCONNECT_RECV other{}; other.dwID = 40; callback(&other, sizeof(other), nullptr);
-        callback(&other, sizeof(other), nullptr);
-        assert(messages.size() == messagesBefore + 1);
-        // Watched commands seen with the press become a conflict report.
-        SIMCONNECT_RECV_EVENT_FRAME tick{};
-        tick.dwID = SIMCONNECT_RECV_ID_EVENT_FRAME; tick.uEventID = 1; tick.fFrameRate = 0;
-        for (int i = 0; i < 10; ++i) callback(&tick, sizeof(tick), nullptr);
-        assert(messages.size() == messagesBefore + 2 && messageNames.back() == "SHIFT_Z_CONTINUED_CONFLICT");
-        assert(messages.back().find("\"cycle\"") != std::string::npos);
-        assert(messages.back().find("\"SLEW_TOGGLE\"") != std::string::npos);
-        assert(messages.back().find("\"AUTORUDDER_TOGGLE\"") != std::string::npos);
-        // Exceptions are counted; unknown watched names are logged by name, others only the first few.
-        assert(std::string(watchedCommandForSend(2 * (watchEvent("SLEW_TOGGLE") - kWatchFirstEvent + 1))) == "SLEW_TOGGLE");
-        assert(std::string(watchedCommandForSend(2)) == shiftz::kWatchedCommands[0]);
-        assert(!watchedCommandForSend(0) && !watchedCommandForSend(3) && !watchedCommandForSend(2 * shiftz::kWatchedCommandCount + 2));
-        SIMCONNECT_RECV_EXCEPTION error{}; error.dwID = SIMCONNECT_RECV_ID_EXCEPTION;
-        error.dwException = SIMCONNECT_EXCEPTION_NAME_UNRECOGNIZED; error.dwSendID = 4;
-        callback(&error, sizeof(error), nullptr);
-        assert(loggedExceptions == 0);  // an unknown watched name does not use a log slot
-        error.dwException = 3; error.dwSendID = 5;
-        for (int i = 0; i < 6; ++i) callback(&error, sizeof(error), nullptr);
-        assert(simConnectExceptions == 7 && loggedExceptions == kLoggedExceptions);
-        SIMCONNECT_RECV open{}; open.dwID = SIMCONNECT_RECV_ID_OPEN; callback(&open, sizeof(open), nullptr);
-        messages.clear(); messageNames.clear();
-    }
-    constexpr int kRegistrationCalls = 23;
-    assert(inputEnabled && hotkeyCall == kRegistrationCalls);
-    assert((inputDefinitions == std::vector<std::string>{
-        "VK_LSHIFT+Z", "VK_LSHIFT+z", "VK_RSHIFT+Z", "VK_RSHIFT+z",
-        "VK_LCONTROL+VK_LSHIFT+Z", "VK_LCONTROL+VK_LSHIFT+z", "VK_LCONTROL+VK_RSHIFT+Z", "VK_LCONTROL+VK_RSHIFT+z",
-        "VK_RCONTROL+VK_LSHIFT+Z", "VK_RCONTROL+VK_LSHIFT+z", "VK_RCONTROL+VK_RSHIFT+Z", "VK_RCONTROL+VK_RSHIFT+z"}));
-    assert((notificationEvents == std::vector<SIMCONNECT_CLIENT_EVENT_ID>{
-        kCycleDownEvent, kCycleUpEvent, kConfigDownEvent, kConfigUpEvent}));
-    SIMCONNECT_RECV_EVENT_FRAME frame{};
-    frame.dwID = SIMCONNECT_RECV_ID_EVENT_FRAME; frame.uEventID = 1; frame.fFrameRate = 4;
-    callback(&frame, sizeof(frame), nullptr);
-    assert(messages.size() == 1 && messages[0] == "{\"fps\":4.00}");
-    assert(messageNames[0] == "SHIFT_Z_CONTINUED_FPS");
-    frame.fFrameRate = 0; callback(&frame, sizeof(frame), nullptr);
-    frame.fFrameRate = std::numeric_limits<float>::quiet_NaN(); callback(&frame, sizeof(frame), nullptr);
-    frame.fFrameRate = 4; frame.uEventID = 99; callback(&frame, sizeof(frame), nullptr);
-    callback(&frame, sizeof(SIMCONNECT_RECV), nullptr);
-    assert(messages.size() == 1);
-    frame.uEventID = 2; callback(&frame, sizeof(frame), nullptr);
-    assert(messages.size() == 2);
-    SIMCONNECT_RECV_EVENT key{};
-    key.dwID = SIMCONNECT_RECV_ID_EVENT;
-    key.uEventID = 99; callback(&key, sizeof(key), nullptr);
-    key.uEventID = kCycleDownEvent; callback(&key, sizeof(SIMCONNECT_RECV), nullptr);
-    assert(messages.size() == 2);
-    callback(&key, sizeof(key), nullptr);
-    callback(&key, sizeof(key), nullptr); // A held key must cycle only once.
-    assert(messages.size() == 3 && messages.back() == "{}");
-    assert(messageNames.back() == "SHIFT_Z_CONTINUED_CYCLE");
-    key.uEventID = kCycleUpEvent; callback(&key, sizeof(key), nullptr);
-    key.uEventID = kCycleDownEvent; callback(&key, sizeof(key), nullptr);
-    assert(messages.size() == 4);
-    // Configuration key: one message per press, independent of the cycle latch.
-    key.uEventID = kConfigDownEvent; callback(&key, sizeof(key), nullptr);
-    callback(&key, sizeof(key), nullptr);
-    assert(messages.size() == 5 && messageNames.back() == "SHIFT_Z_CONTINUED_CONFIG" && messages.back() == "{}");
-    key.uEventID = kConfigUpEvent; callback(&key, sizeof(key), nullptr);
-    key.uEventID = kConfigDownEvent; callback(&key, sizeof(key), nullptr);
-    assert(messages.size() == 6 && messageNames.back() == "SHIFT_Z_CONTINUED_CONFIG");
-    key.uEventID = kConfigUpEvent; callback(&key, sizeof(key), nullptr);
-    testKeyEventsAndRemap();
-    module_deinit(); assert(closed == 1 && !setKeysHandler);
-    // Every registration failure must leave FPS dispatch alive and remove partial inputs.
-    for (int failure = 1; failure <= kRegistrationCalls; ++failure) {
-        hotkeyCall = 0; failHotkeyCall = failure;
-        const int clearedBeforeFailure = clearedInputs;
-        module_init();
-        assert(connection && !inputEnabled && !cycleKeyDown && !configKeyDown);
-        assert(clearedInputs > clearedBeforeFailure && !setKeysHandler);
-        assert(keysLVar == FS_VAR_INVALID_ID);
-        const auto before = messages.size();
-        callback(&frame, sizeof(frame), nullptr);
-        assert(messages.size() == before + 1 && messageNames.back() == "SHIFT_Z_CONTINUED_FPS");
-        module_deinit();
-    }
-    failHotkeyCall = 0;
-    const int closedBeforeFailures = closed;
-    fail_open = 1; module_init(); module_deinit(); assert(closed == closedBeforeFailures);
-    fail_open = 0; fail_subscribe = 1; module_init(); module_deinit(); assert(closed == closedBeforeFailures + 1);
+#if defined(_MSC_VER)
+    // A failed assert or a crash prints to stderr and exits; no dialog that waits for a click.
+    SetErrorMode(0x0001 | 0x0002);  // SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX
+    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+    _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
+    testParsing();
+    testDetector();
+    testModule();
+    testStartupFailures();
+    return 0;
 }

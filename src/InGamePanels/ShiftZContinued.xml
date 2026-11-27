@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <SimBase.Document Type="InGamePanels" version="1,0">
   <Filename>ShiftZContinued.spb</Filename>
-  <!-- Experimental: a click-through panel covering the screen, mounted without the toolbar.
+  <!-- A click-through panel covering the screen, mounted without the toolbar.
        JS starts in the off view and positions the text itself, so the panel anchor does not decide where it appears.
        Sizes are percent of screen height: 178 wide covers a 16:9 screen. The game sizes the panel window and the
        ingame-ui template reports its height back; without resizeDirections="both" the game started at minHeight (5)

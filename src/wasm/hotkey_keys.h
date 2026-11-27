@@ -1,6 +1,6 @@
 #pragma once
 
-// Parses the key set sent by the panel: "cycle=DEF|DEF;config=DEF|DEF".
+// Parses the request the panel sends: "id=N;watch=0|1;cycle=DEF|DEF;config=DEF|DEF".
 // Each DEF is a SimConnect input string such as VK_LSHIFT+Z. Pure logic, testable on the desktop.
 
 #include <cstddef>
@@ -9,7 +9,7 @@
 namespace shiftz {
 
 struct HotkeySet {
-    static constexpr size_t kMaxDefinitions = 16;  // two modifiers, left/right variants, two letter cases
+    static constexpr size_t kMaxDefinitions = 8;  // two modifiers with a left and a right side, two letter cases
     static constexpr size_t kMaxLength = 40;
     char definitions[2][kMaxDefinitions][kMaxLength + 1] = {};  // [0] cycle, [1] config
     size_t counts[2] = {};
@@ -57,6 +57,32 @@ inline bool parseHotkeySet(const char* text, size_t length, HotkeySet& keys) {
         position = end + 1;
     }
     return seen[0] && seen[1];
+}
+
+struct KeyRequest {
+    unsigned id = 0;
+    bool watch = false;  // watch simulator commands for key conflicts
+    HotkeySet keys;
+};
+
+// Fills request.id as soon as it is readable, so even a rejected request can be answered.
+inline bool parseKeyRequest(const char* text, size_t length, KeyRequest& request) {
+    request = KeyRequest{};
+    if (!text || length < 4 || std::strncmp(text, "id=", 3) != 0) return false;
+    size_t position = 3;
+    unsigned id = 0;
+    for (size_t digits = 0; position < length && text[position] >= '0' && text[position] <= '9'; ++digits) {
+        if (digits == 9) return false;
+        id = id * 10 + static_cast<unsigned>(text[position++] - '0');
+    }
+    if (position == 3) return false;
+    request.id = id;
+    constexpr size_t kWatchLength = 9;  // ";watch=0;"
+    if (length - position < kWatchLength) return false;
+    if (std::strncmp(text + position, ";watch=1;", kWatchLength) == 0) request.watch = true;
+    else if (std::strncmp(text + position, ";watch=0;", kWatchLength) != 0) return false;
+    position += kWatchLength;
+    return parseHotkeySet(text + position, length - position, request.keys);
 }
 
 }  // namespace shiftz

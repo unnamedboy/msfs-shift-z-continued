@@ -1,23 +1,19 @@
 const UPDATE_INTERVAL_MS = 250;
 const FPS_TIMEOUT_MS = 3000;
-// Ctrl+Shift+Z may also trigger the Shift+Z mapping; messages this close together are one key press.
-const OVERLAP_MS = 250;
+const KEYS_TIMEOUT_MS = 3000;
+const STORAGE_WAIT_MS = 5000;
+const MAX_SYNC_TRIES = 3;
+const LOADING_TEXT = 'The saved settings are still loading; try again in a moment.';
+const SYNC_FAILED_TEXT = 'The add-on did not confirm the saved keys; the default keys may be in use.';
 const FPS_MESSAGE = 'SHIFT_Z_CONTINUED_FPS';
 const CYCLE_MESSAGE = 'SHIFT_Z_CONTINUED_CYCLE';
 const CONFIG_MESSAGE = 'SHIFT_Z_CONTINUED_CONFIG';
 const CONFLICT_MESSAGE = 'SHIFT_Z_CONTINUED_CONFLICT';
 const SET_KEYS_MESSAGE = 'SHIFT_Z_CONTINUED_SET_KEYS';
 const KEYS_STATUS_MESSAGE = 'SHIFT_Z_CONTINUED_KEYS_STATUS';
-const KEY_LINK_TIMEOUT_MS = 3000;
-// A hotkey press that ends a key capture also reaches WASM; its message can arrive just after the capture.
-const AFTER_CAPTURE_MS = 500;
-const KEY_LINK_PATHS = { commbus: 'CommBus', lvar: 'LVar' };
-const KEYS_LVAR = 'L:SHIFT_Z_CONTINUED_KEYS';
-const PRESS_CLICK_MS = 1000;
 const HOTKEY_LABELS = { cycle: 'Cycle key', config: 'Settings key' };
 const SETTINGS_KEY = 'SHIFT_Z_CONTINUED_SETTINGS';
 const VIEW = { OFF: 0, FLIGHT: 1, BOTH: 2, COUNT: 3 };
-const MAX_POSITION = 95;
 const FEET_TO_METRES = 0.3048;
 const KNOTS_TO_KMH = 1.852;
 const FIELDS = [
@@ -33,13 +29,13 @@ const FIELDS = [
   { id: 'simrate', label: 'Simulation rate' },
 ];
 
-function clampPosition(value, max = MAX_POSITION) {
-  return Math.min(max, Math.max(0, value));
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
 }
 
-// Largest position (percent) that keeps a box of boxSize fully inside panelSize.
+// Largest position (percent) that keeps a box fully inside the panel; 0 when the box is larger than the panel.
 function maxPosition(boxSize, panelSize) {
-  return boxSize > 0 && boxSize < panelSize ? 100 - boxSize / panelSize * 100 : MAX_POSITION;
+  return panelSize > 0 ? Math.max(0, 100 - boxSize / panelSize * 100) : 0;
 }
 
 function defaultSettings() {
@@ -62,8 +58,8 @@ function parseSettings(raw) {
     return settings;
   }
   if (!stored || typeof stored !== 'object') return settings;
-  if (Number.isFinite(stored.x)) settings.x = clampPosition(stored.x);
-  if (Number.isFinite(stored.y)) settings.y = clampPosition(stored.y);
+  if (Number.isFinite(stored.x)) settings.x = clamp(stored.x, 0, 100);
+  if (Number.isFinite(stored.y)) settings.y = clamp(stored.y, 0, 100);
   if (stored.fields && typeof stored.fields === 'object') {
     FIELDS.forEach(field => {
       if (typeof stored.fields[field.id] === 'boolean') settings.fields[field.id] = stored.fields[field.id];
@@ -80,12 +76,12 @@ function parseSettings(raw) {
   return settings;
 }
 
-function describeError(error) {
+function parseMessage(payload) {
   try {
-    const text = typeof error === 'string' ? error : JSON.stringify(error);
-    return (text || String(error)).slice(0, 120);
+    const message = typeof payload === 'string' ? JSON.parse(payload) : payload;
+    return message && typeof message === 'object' ? message : null;
   } catch (_) {
-    return String(error).slice(0, 120);
+    return null;
   }
 }
 
@@ -96,53 +92,79 @@ class ShiftZContinued extends UIElement {
     this.statsElement = this.querySelector('#stats');
     this.configElement = this.querySelector('#config');
     this.view = VIEW.OFF;
-    this.previousView = VIEW.OFF;
-    this.lastCycleAt = -Infinity;
-    this.lastConfigAt = -Infinity;
     this.configMode = false;
     this.drag = null;
     this.fps = null;
     this.fpsUpdatedAt = 0;
-    this.settingsChanged = false;
-    this.settings = this.loadSettings();
+    const stored = this.readStoredSettings();
+    this.settings = parseSettings(stored);
+    // Before dataStorageReady the saved settings can read as missing. Until they are known nothing is
+    // saved, no key can be changed and nothing is sent to WASM, so defaults never replace the player's
+    // keys, items or Ignore.
+    this.storageLoaded = typeof stored === 'string' && stored.length > 0;
+    this.connectedAt = Date.now();
+    this.busConnected = false;
+    this.synced = false;  // false: the saved keys and the watch setting still have to go to WASM
+    this.syncTries = 0;   // sync attempts in a row that WASM did not confirm
+    this.syncSentAt = 0;
+    this.keysConfirmed = false;  // WASM answered "applied" for the keys in settings.keys
+    this.unsaved = false;
     this.conflict = null;
     this.capturing = null;
-    this.captureMessage = '';
-    this.captureEndedAt = -Infinity;
-    this.keyLink = null;
-    // A random start keeps a reloaded panel from repeating the value still in the L:var.
-    this.keySendCount = Math.floor(Math.random() * 1000);
+    this.message = '';
+    // settings.keys hold the keys the WASM module confirmed; a change waits in keyRequest until it answers.
+    this.keyRequest = null;
+    this.requestCount = 0;
+    // Presses are numbered by the WASM module; a conflict report for a press made before the settings were
+    // closed must not open them again.
+    this.lastPress = 0;
+    this.closedAfterPress = 0;
 
     this.onFps = payload => {
-      try {
-        const message = typeof payload === 'string' ? JSON.parse(payload) : payload;
-        if (message && Number.isFinite(message.fps) && message.fps > 0) {
-          this.fps = message.fps;
-          this.fpsUpdatedAt = Date.now();
-        }
-      } catch (_) {
-        // Ignore malformed messages from the communication bus.
+      const message = parseMessage(payload);
+      if (message && Number.isFinite(message.fps) && message.fps > 0) {
+        this.fps = message.fps;
+        this.fpsUpdatedAt = Date.now();
       }
     };
-    this.onCycleMessage = () => this.onCycle();
-    this.onConfigMessage = () => this.onConfig();
+    this.onCycleMessage = payload => this.onHotkey(payload, () => this.onCycle());
+    this.onConfigMessage = payload => this.onHotkey(payload, () => this.setConfigMode(!this.configMode));
     this.onConflictMessage = payload => this.onConflict(payload);
     this.onKeysStatusMessage = payload => this.onKeysStatus(payload);
     this.onKeyDown = event => this.captureKey(event);
     this.onDragStart = event => this.startDrag(event);
     this.onDragMove = event => this.moveDrag(event);
     this.onDragEnd = () => this.endDrag();
-    // The sim's data storage is only attached after this event, so settings read at startup can be missing.
+    // The sim's data storage is only attached after this event. If the settings could not be read before,
+    // what it holds replaces anything chosen meanwhile.
     this.onStorageReady = () => {
-      if (this.settingsChanged) return;
-      this.settings = this.loadSettings();
-      this.sendKeys();
+      if (this.storageLoaded) return;
+      const saved = this.readStoredSettings();
+      const sent = settings => JSON.stringify([settings.keys, settings.ignoreConflicts]);
+      const before = sent(this.settings);
+      const dropped = Boolean(this.keyRequest) && typeof saved === 'string' && saved.length > 0;
+      if (typeof saved === 'string' && saved.length > 0) {
+        this.settings = parseSettings(saved);
+        this.keyRequest = null;  // an answer about the settings used so far must not touch the saved ones
+        this.conflict = null;    // it named the keys shown before
+        this.message = '';
+        this.drag = null;
+        this.unsaved = false;
+      } else {
+        this.unsaved = true;     // nothing saved yet: keep what was chosen meanwhile
+      }
+      this.storageLoaded = true;
+      // WASM may hold what was sent before, or be working on a request that was just dropped.
+      if (dropped || sent(this.settings) !== before) this.requestSync();
       this.render();
     };
 
     if (typeof RegisterCommBusListener === 'function') {
-      // The WASM module keeps its default keys until the panel sends the player's keys.
-      this.commBus = RegisterCommBusListener(() => this.sendKeys());
+      // The WASM module keeps its current keys until the panel sends the player's keys.
+      this.commBus = RegisterCommBusListener(() => {
+        this.busConnected = true;
+        this.render();
+      });
       this.commBus.on(FPS_MESSAGE, this.onFps);
       this.commBus.on(CYCLE_MESSAGE, this.onCycleMessage);
       this.commBus.on(CONFIG_MESSAGE, this.onConfigMessage);
@@ -177,16 +199,42 @@ class ShiftZContinued extends UIElement {
     super.disconnectedCallback();
   }
 
-  loadSettings() {
+  readStoredSettings() {
     try {
-      return parseSettings(typeof GetStoredData === 'function' ? GetStoredData(SETTINGS_KEY) : null);
+      return typeof GetStoredData === 'function' ? GetStoredData(SETTINGS_KEY) : null;
     } catch (_) {
-      return defaultSettings();
+      return null;
     }
   }
 
+  // If the storage never reports ready (it was ready before this panel existed and holds nothing yet),
+  // the settings in use count as the saved ones after a short wait.
+  settingsKnown() {
+    return this.storageLoaded || Date.now() - this.connectedAt >= STORAGE_WAIT_MS;
+  }
+
+  requestSync() {
+    this.synced = false;
+    this.syncTries = 0;
+    this.keysConfirmed = false;
+  }
+
+  // Sends the saved keys and the watch setting when they are known and no other request is waiting.
+  // An unconfirmed attempt is repeated after a pause; after MAX_SYNC_TRIES it stops until something asks
+  // for a sync again.
+  syncWhenReady() {
+    if (this.synced || !this.busConnected || this.keyRequest || !this.settingsKnown()) return;
+    if (this.syncTries >= MAX_SYNC_TRIES) return;
+    if (this.syncTries > 0 && Date.now() - this.syncSentAt < KEYS_TIMEOUT_MS) return;
+    this.syncSentAt = Date.now();
+    this.synced = true;
+    if (!this.sendKeys(this.settings.keys, 'sync')) this.synced = false;
+  }
+
+  // A change made before the saved settings are known is written once they are.
   saveSettings() {
-    this.settingsChanged = true;
+    this.unsaved = !this.settingsKnown();
+    if (this.unsaved) return;
     try {
       if (typeof SetStoredData === 'function') SetStoredData(SETTINGS_KEY, JSON.stringify(this.settings));
     } catch (_) {
@@ -194,122 +242,116 @@ class ShiftZContinued extends UIElement {
     }
   }
 
-  // Sent over CommBus and through an L:var: the WASM module applies whichever arrives and reports back.
-  // The card only mentions the paths when neither one delivered the keys.
-  sendKeys(now = Date.now()) {
-    const keys = this.settings.keys;
-    const link = { sentAt: now, commbus: 'sent', lvar: 'sent' };
-    this.keyLink = link;
-    this.keySendCount += 1;
-    // WASM only acts on a changed value; after a reload the random counter can repeat the stored one.
-    let code = hotkeySetCode(keys, this.keySendCount);
-    if (this.readSimVar(KEYS_LVAR, 'number') === code) code = hotkeySetCode(keys, ++this.keySendCount);
-    const send = (path, call) => {
-      if (!call) {
-        link[path] = 'unavailable';
-        return;
-      }
-      try {
-        const result = call();
-        if (result && typeof result.catch === 'function') {
-          result.catch(error => {
-            if (link[path] === 'sent') link[path] = `call failed: ${describeError(error)}`;
-            this.render();
-          });
-        }
-      } catch (error) {
-        link[path] = `call failed: ${describeError(error)}`;
-      }
+  // kind: 'user' for a key the player just chose, 'sync' to (re)send the saved keys and the watch setting,
+  // 'defaults' when the saved keys did not work. Only the newest request is answered.
+  // Returns false when there is no bus to send on.
+  sendKeys(keys, kind) {
+    if (!this.commBus || typeof this.commBus.callWasm !== 'function') return false;
+    const request = { id: ++this.requestCount, keys, kind, watch: !this.settings.ignoreConflicts, sentAt: Date.now() };
+    this.keyRequest = request;
+    // A call that fails says nothing about the keys, so it counts like a missing answer.
+    const fail = () => {
+      if (this.keyRequest === request) this.finishKeys('timeout');
     };
-    send('commbus', this.commBus && typeof this.commBus.callWasm === 'function'
-      && (() => this.commBus.callWasm(SET_KEYS_MESSAGE, hotkeySetText(keys))));
-    send('lvar', typeof SimVar !== 'undefined' && typeof SimVar.SetSimVarValue === 'function'
-      && (() => SimVar.SetSimVarValue(KEYS_LVAR, 'number', code)));
+    try {
+      const result = this.commBus.callWasm(SET_KEYS_MESSAGE,
+        keyRequestText(request.id, keys, request.watch));
+      if (result && typeof result.catch === 'function') result.catch(fail);
+    } catch (_) {
+      fail();
+    }
+    return true;
   }
 
   onKeysStatus(payload) {
-    let message;
-    try {
-      message = typeof payload === 'string' ? JSON.parse(payload) : payload;
-    } catch (_) {
-      return;
+    const message = parseMessage(payload);
+    if (!message || !this.keyRequest || message.id !== this.keyRequest.id) return;
+    this.finishKeys(message.result === 'applied' ? 'applied' : 'failed');
+  }
+
+  finishKeys(result) {
+    const request = this.keyRequest;
+    this.keyRequest = null;
+    if (result === 'applied') {
+      this.keysConfirmed = true;
+      this.syncTries = 0;
+      // WASM now holds these keys; nothing more to send unless Ignore changed the watch setting meanwhile.
+      this.synced = request.watch === !this.settings.ignoreConflicts;
+      if (request.kind !== 'sync') {
+        Object.keys(HOTKEY_LABELS).forEach(key => {
+          if (this.conflict && this.conflict.key === key && !sameCombo(request.keys[key], this.settings.keys[key])) {
+            this.conflict = null;
+          }
+        });
+        this.settings.keys = request.keys;
+        this.saveSettings();
+        this.message = request.kind === 'user' ? '' : 'The saved keys did not work in MSFS; the default keys are back.';
+      }
+    } else if (request.kind === 'user' && result === 'failed') {
+      // WASM has put back the keys it last confirmed. Those are the saved keys, unless this change
+      // replaced a send of the saved keys that was still unanswered.
+      this.message = 'MSFS did not accept the new key; the previous keys stay in use.';
+      if (!this.keysConfirmed) this.requestSync();
+    } else if (request.kind === 'user') {
+      this.message = 'The add-on did not confirm the new key; the previous keys stay in use.';
+      this.requestSync();  // WASM may apply the key after all (a late answer), so it gets the saved keys again
+    } else {
+      // The saved keys were not confirmed: try the defaults when WASM rejected them, otherwise send again.
+      this.keysConfirmed = false;
+      if (request.kind === 'sync') this.syncTries += 1;
+      if (request.kind === 'sync' && result === 'failed') this.sendKeys(defaultSettings().keys, 'defaults');
+      else this.synced = false;
     }
-    if (!message || !this.keyLink || !KEY_LINK_PATHS[message.via] || typeof message.result !== 'string') return;
-    this.keyLink[message.via] = message.result;
     this.render();
   }
 
-  // Empty while a path may still deliver the keys or once one has; otherwise names what each path reported.
-  keyLinkText(now = Date.now()) {
-    if (!this.keyLink) return '';
-    const paths = Object.keys(KEY_LINK_PATHS);
-    const states = paths.map(path => {
-      const state = this.keyLink[path];
-      return state === 'sent' && now - this.keyLink.sentAt > KEY_LINK_TIMEOUT_MS ? 'no reply' : state;
-    });
-    if (states.includes('applied') || states.includes('sent')) return '';
-    const parts = paths.map((path, index) => `${KEY_LINK_PATHS[path]} ${states[index]}`);
-    return `The new keys did not reach the add-on (${parts.join(', ')}).`;
+  onHotkey(payload, action) {
+    const message = parseMessage(payload);
+    if (message && Number.isInteger(message.press)) this.lastPress = Math.max(this.lastPress, message.press);
+    // While a key is captured, or the captured key is not confirmed yet, the pressed keys belong to the capture.
+    if (this.capturing || (this.keyRequest && this.keyRequest.kind === 'user')) return;
+    action();
   }
 
-  onCycle(now = Date.now()) {
-    if (this.capturing || now - this.captureEndedAt < AFTER_CAPTURE_MS || now - this.lastConfigAt < OVERLAP_MS) return;
-    this.previousView = this.view;
-    this.lastCycleAt = now;
+  onCycle() {
     this.view = (this.view + 1) % VIEW.COUNT;
     this.render();
   }
 
-  onConfig(now = Date.now()) {
-    if (this.capturing || now - this.captureEndedAt < AFTER_CAPTURE_MS) return;
-    if (now - this.lastCycleAt < OVERLAP_MS) {
-      this.view = this.previousView;
-      this.lastCycleAt = -Infinity;
-    }
-    this.lastConfigAt = now;
-    this.setConfigMode(!this.configMode);
-  }
-
-  // The WASM module saw simulator commands fire together with one of our keys.
+  // The WASM module saw simulator commands fire right after one of our keys.
   onConflict(payload) {
-    let message;
-    try {
-      message = typeof payload === 'string' ? JSON.parse(payload) : payload;
-    } catch (_) {
-      return;
-    }
-    if (!message || !HOTKEY_LABELS[message.key] || !Array.isArray(message.events)) return;
-    // The WASM module sends SimConnect command names; the MSFS controls may show a more readable name.
-    const commands = message.events.filter(name => typeof name === 'string' && name.length > 0);
-    if (!commands.length || this.settings.ignoreConflicts) return;
+    const message = parseMessage(payload);
+    // A report is only shown when the keys in the settings are the ones WASM confirmed and no key change
+    // is waiting; otherwise the key that was pressed is not known.
+    if (!this.keysConfirmed || this.settings.ignoreConflicts) return;
+    if (this.keyRequest && this.keyRequest.kind === 'user') return;
+    if (!message || !HOTKEY_LABELS[message.key] || !Array.isArray(message.commands)) return;
+    const commands = message.commands.filter(name => typeof name === 'string' && name.length > 0);
+    if (!commands.length) return;
+    if (!this.configMode && Number.isInteger(message.press) && message.press <= this.closedAfterPress) return;
     this.conflict = { key: message.key, text: comboText(this.settings.keys[message.key]), commands };
     if (this.configMode) this.render();
     else this.setConfigMode(true);
   }
 
-  ignoreConflict() {
-    if (!this.conflict) return;
+  ignoreConflicts() {
     this.settings.ignoreConflicts = true;
     this.conflict = null;
     this.saveSettings();
+    this.requestSync();  // the sync also stops the watch in the WASM module
     this.render();
   }
 
   // The same button starts and cancels a capture (Esc cannot: MSFS opens its pause menu on Esc).
   toggleCapture(key) {
-    if (this.capturing === key) {
-      this.endCapture();
+    if (this.keyRequest && this.keyRequest.kind === 'user') return;  // one change at a time
+    if (!this.settingsKnown()) {
+      this.message = LOADING_TEXT;
     } else {
-      this.capturing = key;
-      this.captureMessage = '';
+      this.capturing = this.capturing === key ? null : key;
+      this.message = '';
     }
     this.render();
-  }
-
-  endCapture(now = Date.now()) {
-    this.capturing = null;
-    this.captureMessage = '';
-    this.captureEndedAt = now;
   }
 
   captureKey(event) {
@@ -318,22 +360,23 @@ class ShiftZContinued extends UIElement {
     const candidate = comboFromKeyEvent(event);
     if (!candidate) return;
     if (candidate.cancel) {
-      this.endCapture();
+      this.capturing = null;
       this.render();
       return;
     }
     const combo = normalizeCombo(candidate);
     const other = this.capturing === 'cycle' ? 'config' : 'cycle';
     if (!combo) {
-      this.captureMessage = HOTKEY_RULES;
-    } else if (sameCombo(combo, this.settings.keys[other])) {
-      this.captureMessage = `${comboText(combo)} is already the ${HOTKEY_LABELS[other].toLowerCase()}.`;
+      this.message = HOTKEY_RULES;
+    } else if (sameCombo(combo, this.settings.keys[other]) || sameCombo(combo, this.settings.keys[this.capturing])) {
+      // The capture stays armed: WASM also saw this press of a mapped key, and its message must not act.
+      const owner = sameCombo(combo, this.settings.keys[other]) ? other : this.capturing;
+      this.message = `${comboText(combo)} is already the ${HOTKEY_LABELS[owner].toLowerCase()}.`;
     } else {
-      this.settings.keys = Object.assign({}, this.settings.keys, { [this.capturing]: combo });
-      if (this.conflict && this.conflict.key === this.capturing) this.conflict = null;
-      this.endCapture();
-      this.saveSettings();
-      this.sendKeys();
+      const keys = Object.assign({}, this.settings.keys, { [this.capturing]: combo });
+      this.capturing = null;
+      this.message = '';
+      if (!this.sendKeys(keys, 'user')) this.message = 'The add-on is not connected; the key was not changed.';
     }
     this.render();
   }
@@ -341,9 +384,10 @@ class ShiftZContinued extends UIElement {
   setConfigMode(enabled) {
     this.configMode = enabled;
     if (!enabled) {
-      this.drag = null;
-      if (this.capturing) this.endCapture();
-      this.saveSettings();
+      this.endDrag();
+      this.capturing = null;
+      this.message = '';
+      this.closedAfterPress = this.lastPress;
     }
     if (this.rootElement) this.rootElement.classList.toggle('config-mode', enabled);
     this.render();
@@ -360,20 +404,20 @@ class ShiftZContinued extends UIElement {
       return element;
     };
     // In the sim a click on the Change key/Cancel button did not always arrive while a capture was armed,
-    // so those buttons also act on mousedown; the click that follows is then skipped.
+    // so those buttons act on mousedown; the click that belongs to that mousedown is skipped.
     const addButton = (parent, text, action, onPress = false) => {
       const button = addElement(parent, 'div', 'config-button', text);
-      let pressedAt = -Infinity;
+      let pressed = false;
       if (onPress) {
         button.addEventListener('mousedown', event => {
           if (event && event.button > 0) return;
-          pressedAt = Date.now();
+          pressed = true;
           action();
         });
       }
       button.addEventListener('click', () => {
-        if (Date.now() - pressedAt < PRESS_CLICK_MS) return;
-        action();
+        if (!pressed) action();
+        pressed = false;
       });
       return button;
     };
@@ -381,7 +425,7 @@ class ShiftZContinued extends UIElement {
     addElement(card, 'div', 'config-title', 'Shift Z Continued');
     this.warningElement = addElement(card, 'div', 'config-warning');
     this.warningText = addElement(this.warningElement, 'div', 'config-warning-text');
-    this.ignoreButton = addButton(this.warningElement, 'Ignore', () => this.ignoreConflict());
+    addButton(this.warningElement, 'Ignore', () => this.ignoreConflicts());
     this.hintElement = addElement(card, 'div', 'config-hint');
     const list = addElement(card, 'div', 'config-fields');
     this.fieldToggles = {};
@@ -410,17 +454,16 @@ class ShiftZContinued extends UIElement {
       this.keyRows[key] = addElement(row, 'div', 'config-key-text');
       this.keyButtons[key] = addButton(row, 'Change key', () => this.toggleCapture(key), true);
     });
-    this.captureMessageElement = addElement(card, 'div', 'config-message');
-    this.keyLinkElement = addElement(card, 'div', 'config-link');
+    this.messageElement = addElement(card, 'div', 'config-message');
     const actions = addElement(card, 'div', 'config-row');
-    this.resetButton = addButton(actions, 'Reset position', () => {
+    addButton(actions, 'Reset position', () => {
       const defaults = defaultSettings();
       this.settings.x = defaults.x;
       this.settings.y = defaults.y;
       this.saveSettings();
       this.render();
     });
-    this.doneButton = addButton(actions, 'Done', () => this.setConfigMode(false));
+    addButton(actions, 'Done', () => this.setConfigMode(false));
   }
 
   updateConfigCard() {
@@ -430,8 +473,10 @@ class ShiftZContinued extends UIElement {
     });
     this.altitudeToggle.textContent = `Altitude: ${this.settings.altitudeUnit === 'ft' ? 'feet' : 'metres'}`;
     this.speedToggle.textContent = `Speed: ${this.settings.speedUnit === 'kt' ? 'knots' : 'km/h'}`;
-    const keys = this.settings.keys;
-    this.hintElement.textContent = `Drag the red text to move it. ${comboText(keys.config)} or Done to close.`;
+    if (this.message === LOADING_TEXT && this.settingsKnown()) this.message = '';
+    const request = this.keyRequest && this.keyRequest.kind === 'user' ? this.keyRequest : null;
+    const keys = request ? request.keys : this.settings.keys;
+    this.hintElement.textContent = `Drag the red text to move it. ${comboText(this.settings.keys.config)} or Done to close.`;
     Object.keys(this.keyRows).forEach(key => {
       const capturing = this.capturing === key;
       this.keyRows[key].textContent = capturing
@@ -439,17 +484,17 @@ class ShiftZContinued extends UIElement {
         : `${HOTKEY_LABELS[key]}: ${comboText(keys[key])}`;
       this.keyButtons[key].textContent = capturing ? 'Cancel' : 'Change key';
     });
-    this.captureMessageElement.textContent = this.capturing
-      ? (this.captureMessage || 'The keys you press also reach MSFS this once.') : this.captureMessage;
-    const keyLink = this.keyLinkText();
-    this.keyLinkElement.textContent = keyLink;
-    this.keyLinkElement.style.display = keyLink ? 'block' : 'none';
+    this.messageElement.textContent = this.capturing
+      ? (this.message || 'The keys you press also reach MSFS this once.')
+      : request ? 'Applying the new key...'
+        : this.syncTries >= MAX_SYNC_TRIES ? SYNC_FAILED_TEXT : this.message;
     this.warningElement.style.display = this.conflict ? 'block' : 'none';
-    this.warningText.textContent = this.conflict
-      ? `${this.conflict.text} also triggers ${this.conflict.commands.join(', ')} in MSFS. `
-        + 'Remove that binding in the MSFS keyboard controls, change the key below, '
-        + 'or press Ignore to stop all key conflict warnings.'
-      : '';
+    if (this.conflict) {
+      const { text, commands } = this.conflict;
+      this.warningText.textContent = `${text} may also trigger ${commands.join(', ')} in MSFS: `
+        + `${commands.length > 1 ? 'they' : 'it'} ran right after the key press. If so, remove that binding in the `
+        + 'MSFS keyboard controls, change the key below, or press Ignore to stop all key conflict warnings.';
+    }
   }
 
   panelSize() {
@@ -461,33 +506,29 @@ class ShiftZContinued extends UIElement {
     };
   }
 
+  textSize() {
+    const rect = typeof this.statsElement.getBoundingClientRect === 'function'
+      ? this.statsElement.getBoundingClientRect() : null;
+    return { width: rect ? rect.width : 0, height: rect ? rect.height : 0 };
+  }
+
   startDrag(event) {
     if (!this.configMode || event.button > 0) return;
-    this.drag = { mouseX: event.clientX, mouseY: event.clientY, x: this.settings.x, y: this.settings.y, width: 0, height: 0 };
+    const shown = this.shownPosition();
+    this.drag = { mouseX: event.clientX, mouseY: event.clientY, x: shown.x, y: shown.y };
     if (typeof event.preventDefault === 'function') event.preventDefault();
   }
 
   moveDrag(event) {
     if (!this.drag) return;
-    const { width, height } = this.panelSize();
-    if (!(width > 0) || !(height > 0)) return;
-    const box = this.textBoxSize();
-    this.settings.x = clampPosition(this.drag.x + (event.clientX - this.drag.mouseX) / width * 100,
-                                    maxPosition(box.width, width));
-    this.settings.y = clampPosition(this.drag.y + (event.clientY - this.drag.mouseY) / height * 100,
-                                    maxPosition(box.height, height));
+    const panel = this.panelSize();
+    if (!(panel.width > 0) || !(panel.height > 0)) return;
+    const text = this.textSize();
+    this.settings.x = clamp(this.drag.x + (event.clientX - this.drag.mouseX) / panel.width * 100,
+                            0, maxPosition(text.width, panel.width));
+    this.settings.y = clamp(this.drag.y + (event.clientY - this.drag.mouseY) / panel.height * 100,
+                            0, maxPosition(text.height, panel.height));
     this.applyPosition();
-  }
-
-  // An absolute box shrinks to the space left at the panel edge while its text keeps its width, so measuring
-  // only the box lets each move creep further out. Use the content width and the widest size seen in this drag.
-  textBoxSize() {
-    const element = this.statsElement;
-    const rect = typeof element.getBoundingClientRect === 'function'
-      ? element.getBoundingClientRect() : { width: 0, height: 0 };
-    this.drag.width = Math.max(this.drag.width, rect.width || 0, element.scrollWidth || 0);
-    this.drag.height = Math.max(this.drag.height, rect.height || 0, element.scrollHeight || 0);
-    return { width: this.drag.width, height: this.drag.height };
   }
 
   endDrag() {
@@ -496,9 +537,23 @@ class ShiftZContinued extends UIElement {
     this.saveSettings();
   }
 
+  // The text sits at the panel's top-left corner and is moved with a transform, so it never wraps or shrinks
+  // at the edge. The saved position is kept; what is shown is held inside the panel whatever the text,
+  // units or screen size, so the text cannot end up off screen.
+  shownPosition() {
+    const panel = this.panelSize();
+    const text = this.textSize();
+    return {
+      x: clamp(this.settings.x, 0, maxPosition(text.width, panel.width)),
+      y: clamp(this.settings.y, 0, maxPosition(text.height, panel.height)),
+    };
+  }
+
   applyPosition() {
-    this.statsElement.style.left = `${this.settings.x}%`;
-    this.statsElement.style.top = `${this.settings.y}%`;
+    const panel = this.panelSize();
+    const { x, y } = this.shownPosition();
+    this.statsElement.style.transform =
+      `translate(${Math.round(x / 100 * panel.width)}px, ${Math.round(y / 100 * panel.height)}px)`;
   }
 
   readSimVar(name, unit) {
@@ -619,23 +674,22 @@ class ShiftZContinued extends UIElement {
 
   render() {
     if (!this.statsElement) return;
-    this.applyPosition();
+    if (this.unsaved && this.settingsKnown()) this.saveSettings();
+    this.syncWhenReady();
+    if (this.keyRequest && Date.now() - this.keyRequest.sentAt > KEYS_TIMEOUT_MS) this.finishKeys('timeout');
     this.updateConfigCard();
     // Configuration mode always previews both lines so there is something to drag.
     const view = this.configMode ? VIEW.BOTH : this.view;
     if (view === VIEW.OFF) {
       this.setText('');
-      return;
-    }
-    if (typeof SimVar === 'undefined') {
+    } else if (typeof SimVar === 'undefined') {
       this.setText('Waiting for simulator data...');
-      return;
+    } else {
+      const lines = [this.formatFlightData()];
+      if (view === VIEW.BOTH) lines.push(this.formatPerformanceData());
+      this.setText(lines.filter(line => line).join('\n') || (this.configMode ? '(no items selected)' : ''));
     }
-
-    const lines = [this.formatFlightData()];
-    if (view === VIEW.BOTH) lines.push(this.formatPerformanceData());
-    const text = lines.filter(line => line).join('\n');
-    this.setText(text || (this.configMode ? '(no items selected)' : ''));
+    this.applyPosition();
   }
 }
 
